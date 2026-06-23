@@ -47,7 +47,7 @@ def _embed_absolute(img, identifier, content_hash):
     dr, dg, db = bar._dominant_color(img)
     dom = (dr + dg + db) / 3
 
-    def bit_rgb(bit):
+    def bit_rgb(bit, x=None):
         off = (192 if bit else 64) - dom
         return tuple(max(0, min(255, round(c + off))) for c in (dr, dg, db))
 

@@ -108,7 +108,35 @@ _PIXELS_PER_BIT_NARROW = 2    # 2px/bit for narrower images (768px portraits)
 _RGB_TARGET_0 = 64           # legacy absolute levels — still read via the 128 candidate
 _RGB_TARGET_1 = 192
 _RGB_THRESHOLD = 128         # absolute decode candidate (legacy bars + always-present fallback)
-_BAR_DELTA = 96              # centered scheme: bit-0/bit-1 brightness separation (dom ± 48)
+# --- Asym row-3-copy camouflage (Gen I, decode-compatible) --------------------
+# The data bits ride a PER-COLUMN center that copies the smoothed content one row
+# ABOVE the bar (floored on dark, hue-preserving): a "1" bit IS that level
+# (so it reads as a continuation of the image — invisible), a "0" bit is darker
+# by _ASYM_DELTA, and filler past the payload is "1" (invisible). The decoder
+# never compares to the bar's own (asymmetric, biased) distribution — it
+# RE-PREDICTS the per-column "1" level from the preserved row above and
+# thresholds delta/2 below it. That makes it robust (q35+, multi-pass, Discord,
+# worst-case noise validated) AND much quieter than the centered scheme.
+# Backward-compatible: a new decode CANDIDATE; legacy/centered bars still decode
+# on the Otsu/128 candidates. New mints get the quiet bar; existing are untouched.
+_ASYM_ENCODE = True
+_ASYM_DELTA = 48             # "0" sits this far below the per-column "1" level
+_ASYM_FLOOR = 70             # min luma for a detectable "1" on near-black content
+_ASYM_BOX_RADIUS = 34        # px; box-blur radius for the per-column center (encode + decode).
+                             # A box filter (integer-sum / one division), NOT a Gaussian:
+                             # math.exp diverges by 1 ULP between glibc and V8, which would
+                             # break byte-exact writer parity (tests/bar_encode_parity.cjs).
+                             # A box filter is IEEE-deterministic across runtimes. Radius 34
+                             # (window 69) approximates the prior sigma-20 Gaussian support.
+
+_BAR_DELTA = 64              # centered scheme (legacy/fallback): bit-0/bit-1 separation (dom ± 32).
+                             # Lowered from 96 to camouflage the data strip (~33% quieter, and
+                             # the "1" bits on dark content drop from ~96 to ~64). 64 is the
+                             # measured floor that still survives JPEG q50 on a WORST-CASE
+                             # full-width-noise image (56 fails q50). Otsu decode is adaptive +
+                             # RS covers the rest, so no decoder change and legacy 96-delta
+                             # bars still decode. New mints get quieter bars; existing
+                             # bars are unaffected.
 
 
 
@@ -127,6 +155,86 @@ def _crc16(data):
                 crc <<= 1
             crc &= 0xFFFF
     return crc
+
+
+# ---------------------------------------------------------------------------
+# Asym camouflage helpers (per-column center from the row above the bar)
+# ---------------------------------------------------------------------------
+
+def _smooth1d(values, radius):
+    """Pure-Python 1-D box blur (moving average) with edge padding.
+
+    A box filter — integer/float sum over a fixed window divided once — is
+    IEEE-deterministic across runtimes (Python and V8 produce bit-identical
+    doubles given identical inputs), which a Gaussian is NOT (math.exp differs
+    by 1 ULP glibc↔V8). That bit-identity is what lets the JS bar writer stay
+    byte-for-byte equal to the Python writer (the parity test), so the asym
+    camo center is re-derived identically on both sides.
+    """
+    n = len(values)
+    if n == 0 or radius <= 0:
+        return list(values)
+    width = 2 * radius + 1
+    out = [0.0] * n
+    for i in range(n):
+        acc = 0.0
+        for k in range(-radius, radius + 1):
+            idx = i + k
+            idx = 0 if idx < 0 else (n - 1 if idx >= n else idx)
+            acc += values[idx]
+        out[i] = acc / width
+    return out
+
+
+def _hue_floor(r, g, b, floor):
+    """Brighten a colour to a minimum luma, preserving hue; pitch-black -> gray."""
+    L = 0.299 * r + 0.587 * g + 0.114 * b
+    if L >= floor:
+        return r, g, b
+    if L < 2:
+        return float(floor), float(floor), float(floor)
+    s = floor / L
+    return min(255.0, r * s), min(255.0, g * s), min(255.0, b * s)
+
+
+def _asym_center_columns(img, w, h):
+    """Per-column (center_rgb, center_luma) for the asym scheme: the smoothed,
+    floored colour of the row immediately above the bar. The "1" bits copy this
+    (camouflage); "0" = center - delta. The decoder re-derives the same curve."""
+    y = h - _SIG_ROWS - 1                  # row immediately above the 2 bar rows
+    if y < 0:
+        y = max(0, h - 1)
+    rr = [0.0] * w; gg = [0.0] * w; bb = [0.0] * w
+    for x in range(w):
+        px = img.getpixel((x, y))[:3]
+        rr[x], gg[x], bb[x] = px[0], px[1], px[2]
+    rr = _smooth1d(rr, _ASYM_BOX_RADIUS); gg = _smooth1d(gg, _ASYM_BOX_RADIUS); bb = _smooth1d(bb, _ASYM_BOX_RADIUS)
+    center_rgb = []; center_lum = []
+    for x in range(w):
+        r, g, b = _hue_floor(rr[x], gg[x], bb[x], _ASYM_FLOOR)
+        center_rgb.append((r, g, b))
+        center_lum.append(0.299 * r + 0.587 * g + 0.114 * b)
+    return center_rgb, center_lum
+
+
+def _asym_threshold_curve(img):
+    """Per-column decode threshold: the predicted "1" level (from the row above)
+    minus delta/2 — the midpoint between the "1" (=center) and "0" (=center-delta)
+    levels. Robust because it's re-derived from preserved content, not the bar."""
+    w, h = img.size
+    _, center_lum = _asym_center_columns(img, w, h)
+    half = _ASYM_DELTA / 2.0
+    return [center_lum[x] - half for x in range(w)]
+
+
+def _thr(threshold, px):
+    """Threshold at column ``px``. A scalar candidate returns as-is; the asym
+    candidate is a per-column list (the row-3-predicted threshold curve)."""
+    if isinstance(threshold, list):
+        if 0 <= px < len(threshold):
+            return threshold[px]
+        return threshold[-1] if threshold else _RGB_THRESHOLD
+    return threshold
 
 
 # ---------------------------------------------------------------------------
@@ -208,12 +316,11 @@ def _write_even_fill(img, w, h, bits, bit_rgb):
         for i in range(n):
             x0 = a + round(i * span / n)
             x1 = a + round((i + 1) * span / n)
-            rgb = bit_rgb(bits[i])
             for x in range(x0, x1):
-                img.putpixel((x, y), rgb)
+                img.putpixel((x, y), bit_rgb(bits[i], x))
 
 
-def _write_sequential(img, w, h, data_width, bits, bit_rgb, dom_r, dom_g, dom_b, payload):
+def _write_sequential(img, w, h, data_width, bits, bit_rgb, dom_r, dom_g, dom_b, payload, filler_bit=0):
     """Legacy/small-image layout: split the frame sequentially across the two
     rows at an integer px/bit (3, falling back to 2 for narrow images). Kept
     byte-identical to the original so small images and pre-existing bars are
@@ -243,17 +350,14 @@ def _write_sequential(img, w, h, data_width, bits, bit_rgb, dom_r, dom_g, dom_b,
             bit_idx = row_bit_start + bit_idx_local
             base_x = _HEADER_PIXELS + bit_idx_local * ppb
             if bit_idx < len(bits):
-                rgb = bit_rgb(bits[bit_idx])
                 for px in range(ppb):
-                    img.putpixel((base_x + px, y), rgb)
+                    img.putpixel((base_x + px, y), bit_rgb(bits[bit_idx], base_x + px))
             else:
-                # Filler past the payload = the bit-0 level (not the dom color),
-                # so the decode brightness histogram stays cleanly bimodal for
-                # Otsu. dom_r/g/b kept in the signature for backward-compat callers.
-                fill = bit_rgb(0)
+                # Filler past the payload. Legacy: bit-0 level (clean Otsu
+                # bimodality). Asym: filler_bit=1 (copies row above = invisible).
                 for px in range(ppb):
                     if base_x + px < w - _FOOTER_PIXELS:
-                        img.putpixel((base_x + px, y), fill)
+                        img.putpixel((base_x + px, y), bit_rgb(filler_bit, base_x + px))
 
 
 # ---------------------------------------------------------------------------
@@ -302,28 +406,51 @@ def embed_into(image, identifier, content_hash):
         for bit_pos in range(7, -1, -1):
             bits.append((byte >> bit_pos) & 1)
 
-    # Dominant color from local context
+    data_width = w - _HEADER_PIXELS - _FOOTER_PIXELS
+
+    # Layout decides the bit-painting scheme. Asym camo is used ONLY for the
+    # sequential layout — its data pixels copy image content, which can be M/Y/C-
+    # hued and would masquerade as the flush bands, fooling the band-EDGE finders
+    # that even-fill decode depends on for anchoring. Sequential at 1:1 reads from
+    # fixed pixel positions (no band-edge dependence), so asym is safe there. The
+    # even-fill regime (large images) keeps the centered gray scheme, whose data
+    # never resembles a band, preserving its drift-free downscale anchoring.
+    is_even_fill = data_width >= _PIXELS_PER_BIT_WIDE * len(bits)
+    use_asym = _ASYM_ENCODE and not is_even_fill
+
+    # Dominant color from local context (legacy/centered scheme + sequential sig).
     dom_r, dom_g, dom_b = _dominant_color(img)
     dom_avg = (dom_r + dom_g + dom_b) / 3
 
-    # Centered brightness: keep the dominant hue, but place the two bit levels
-    # symmetrically around the local dominant brightness instead of pinning them
-    # to absolute 64/192. The center is clamped so the full _BAR_DELTA still fits
-    # in [0,255]; the bar then sinks toward the image's own tone on dark images
-    # (the old absolute 192 always glowed) while keeping the same separation, so
-    # the JPEG envelope is unchanged. The decoder finds the threshold by Otsu.
-    _half = _BAR_DELTA / 2.0
-    _center = max(_half, min(255 - _half, dom_avg))
-    _lo, _hi = _center - _half, _center + _half
+    if use_asym:
+        # Asym camouflage: each bit rides a PER-COLUMN center that copies the
+        # smoothed, floored content one row above. "1" = center (invisible),
+        # "0" = center - delta. Filler past the payload = "1" (invisible). The
+        # decoder re-derives the center from the row above (see _asym_*).
+        _center_rgb, _center_lum = _asym_center_columns(img, w, h)
+        _filler_bit = 1
 
-    def _bit_rgb(bit):
-        target_avg = _hi if bit else _lo
-        offset = target_avg - dom_avg
-        return (max(0, min(255, round(dom_r + offset))),
-                max(0, min(255, round(dom_g + offset))),
-                max(0, min(255, round(dom_b + offset))))
+        def _bit_rgb(bit, x):
+            cr, cg, cb = _center_rgb[x]
+            if bit:
+                return (round(cr), round(cg), round(cb))
+            return (max(0, round(cr - _ASYM_DELTA)),
+                    max(0, round(cg - _ASYM_DELTA)),
+                    max(0, round(cb - _ASYM_DELTA)))
+    else:
+        # Centered brightness (legacy): keep the dominant hue, place the two bit
+        # levels symmetrically around ONE clamped global dominant brightness.
+        _half = _BAR_DELTA / 2.0
+        _center = max(_half, min(255 - _half, dom_avg))
+        _lo, _hi = _center - _half, _center + _half
+        _filler_bit = 0
 
-    data_width = w - _HEADER_PIXELS - _FOOTER_PIXELS
+        def _bit_rgb(bit, x=None):
+            target_avg = _hi if bit else _lo
+            offset = target_avg - dom_avg
+            return (max(0, min(255, round(dom_r + offset))),
+                    max(0, min(255, round(dom_g + offset))),
+                    max(0, min(255, round(dom_b + offset))))
 
     # Layout choice is capacity-emergent, no flag or version bump:
     #   - Above the crossover (the whole frame fits in ONE row at >=3px/bit),
@@ -334,10 +461,11 @@ def embed_into(image, identifier, content_hash):
     #     stronger under JPEG); both-end band anchoring => drift-free decode.
     #   - Below the crossover (small images), fall back to the original
     #     sequential split across the two rows (byte-identical to legacy).
-    if data_width >= _PIXELS_PER_BIT_WIDE * len(bits):
+    if is_even_fill:
         _write_even_fill(img, w, h, bits, _bit_rgb)
     else:
-        _write_sequential(img, w, h, data_width, bits, _bit_rgb, dom_r, dom_g, dom_b, payload)
+        _write_sequential(img, w, h, data_width, bits, _bit_rgb, dom_r, dom_g, dom_b,
+                          payload, filler_bit=_filler_bit)
 
     return img
 
@@ -596,7 +724,7 @@ def _decode_even_fill(img, threshold=_RGB_THRESHOLD):
                         for ry in rows:
                             r, g, bl = img.getpixel((px, ry))[:3]
                             acc += (r + g + bl) / 3.0
-                        bits.append(1 if acc / len(rows) >= threshold else 0)
+                        bits.append(1 if acc / len(rows) >= _thr(threshold, px) else 0)
                     if not ok:
                         continue
                     result = _try_decode_frame(bits)
@@ -636,13 +764,26 @@ def extract_bar(image):
     if otsu is not None:
         thresholds.append(otsu)
     thresholds.append(_RGB_THRESHOLD)
+    # Asym camouflage bar — a PER-COLUMN threshold re-derived from the row above
+    # the bar (predicted "1" level minus delta/2). Tried after the scalar
+    # candidates so legacy/centered bars resolve first; asym bars fail the scalar
+    # candidates (their center varies per column) and resolve here. CRC+RS
+    # self-selects. The curve is computed at the image's current resolution, so
+    # the scale-swept sequential read indexes it correctly on downscaled images.
+    try:
+        thresholds.append(_asym_threshold_curve(img))
+    except Exception:
+        pass
 
     # Band detection is threshold-independent — do it once, reuse per candidate.
+    # Scale 1:1 is ALWAYS tried (band detection isn't needed at native scale, and
+    # it can fail on a heavily-recompressed bar even when the sequential read at
+    # 1:1 still decodes cleanly — CRC+RS guards false positives). Band detection
+    # only adds the resized-scale sweep on top.
     bands = _detect_bar(img)
-    scale_candidates = None
+    scale_candidates = [1.0]
     if bands:
         raw_scale = (sum(bands) / 3) / _HEADER_BAND
-        scale_candidates = [1.0]  # always try 1:1 first
         if abs(raw_scale - 1.0) >= 0.05:
             # Image appears resized. Band width detection can be off by ±2px
             # per band due to JPEG/interpolation, so the scale estimate has
@@ -685,9 +826,17 @@ def _decode_bits_at_scale(img, scale, ppb, threshold=_RGB_THRESHOLD):
         for row_offset in range(_SIG_ROWS):
             y = h - 1 - row_offset
             for bit_idx in range(bits_per_row):
-                cx = data_start + bit_idx * ppb + ppb // 2
-                r, g, b = img.getpixel((cx, y))[:3]
-                bits.append(1 if (r + g + b) / 3 >= threshold else 0)
+                x0 = data_start + bit_idx * ppb
+                # Average ALL ppb columns of the bit (and its threshold) — far
+                # more noise-immune than a single center pixel under JPEG.
+                acc = tacc = 0.0; cnt = 0
+                for dx in range(ppb):
+                    cx = x0 + dx
+                    if cx >= data_end:
+                        break
+                    r, g, b = img.getpixel((cx, y))[:3]
+                    acc += (r + g + b) / 3.0; tacc += _thr(threshold, cx); cnt += 1
+                bits.append(1 if cnt and acc / cnt >= tacc / cnt else 0)
         return bits
 
     # Scaled decode — infer original layout
@@ -699,12 +848,18 @@ def _decode_bits_at_scale(img, scale, ppb, threshold=_RGB_THRESHOLD):
     for row_offset in range(_SIG_ROWS):
         y = h - 1 - row_offset
         for bit_idx in range(orig_bits_per_row):
-            orig_cx = _HEADER_PIXELS + bit_idx * ppb + ppb / 2
-            sx = round(orig_cx * scale)
-            if sx < 0 or sx >= w:
+            # Average the bit's full scaled span (both sides) for noise immunity.
+            sx0 = round((_HEADER_PIXELS + bit_idx * ppb) * scale)
+            sx1 = round((_HEADER_PIXELS + (bit_idx + 1) * ppb) * scale)
+            acc = tacc = 0.0; cnt = 0
+            for sx in range(sx0, max(sx0 + 1, sx1)):
+                if sx < 0 or sx >= w:
+                    break
+                r, g, b = img.getpixel((sx, y))[:3]
+                acc += (r + g + b) / 3.0; tacc += _thr(threshold, sx); cnt += 1
+            if cnt == 0:
                 break
-            r, g, b = img.getpixel((sx, y))[:3]
-            bits.append(1 if (r + g + b) / 3 >= threshold else 0)
+            bits.append(1 if acc / cnt >= tacc / cnt else 0)
     return bits
 
 
