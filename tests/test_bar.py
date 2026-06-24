@@ -267,12 +267,12 @@ class TestBarRSCorrection(unittest.TestCase):
 
     def test_corrects_corrupted_data_bytes(self):
         """Flip a few data bytes in the codeword and verify RS recovers."""
-        # 1024px is below the even-fill crossover (~1392px), so the sequential
-        # split layout is used — which is what this test's byte-targeting math
-        # below assumes. 3px/bit is selected at this width. (RS correction in
-        # the high-res even-fill layout is covered by the JPEG/downscale cases
-        # in test_bar_evenfill.py.)
-        path = _make_test_image(width=1024, height=768)
+        # 768px keeps this on the sequential split layout (the byte-targeting math
+        # below assumes it); the identifier is non-hex so it uses the ASCII payload
+        # path, where the widest fitting ppb here is 3. (1024px would now land on
+        # even-fill under the packed-payload crossover; even-fill RS is covered by
+        # the JPEG/downscale cases in test_bar_evenfill.py.)
+        path = _make_test_image(width=768, height=768)
         identifier = "mememage-rstest000000"
         content_hash = "aabbccdd11223344"
         embed_bar(path, identifier, content_hash)

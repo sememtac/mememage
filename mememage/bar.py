@@ -103,8 +103,10 @@ _HEADER_COLORS = [(255, 0, 255), (255, 255, 0), (0, 255, 255)]
 _FOOTER_COLORS = [(0, 255, 255), (255, 255, 0), (255, 0, 255)]
 _LOCAL_CONTEXT_ROWS = 6
 
-_PIXELS_PER_BIT_WIDE = 3       # 3px/bit for images >= 1024px wide (resize resilient)
+_PIXELS_PER_BIT_WIDE = 3       # crossover ppb: even-fill triggers at data_width >= this * n_bits
 _PIXELS_PER_BIT_NARROW = 2    # 2px/bit for narrower images (768px portraits)
+_PIXELS_PER_BIT_MAX = 6       # sequential picks the WIDEST ppb that fits (fatter = quieter +
+                              # JPEG-tougher); the packed payload frees the room to widen.
 _RGB_TARGET_0 = 64           # legacy absolute levels — still read via the 128 candidate
 _RGB_TARGET_1 = 192
 _RGB_THRESHOLD = 128         # absolute decode candidate (legacy bars + always-present fallback)
@@ -120,7 +122,11 @@ _RGB_THRESHOLD = 128         # absolute decode candidate (legacy bars + always-p
 # Backward-compatible: a new decode CANDIDATE; legacy/centered bars still decode
 # on the Otsu/128 candidates. New mints get the quiet bar; existing are untouched.
 _ASYM_ENCODE = True
-_ASYM_DELTA = 48             # "0" sits this far below the per-column "1" level
+_ASYM_DELTA = 40             # "0" sits this far below the per-column "1" level. Lowered
+                             # 48->40 (~17% quieter) — the packed payload's fatter bits give
+                             # the room. Δ40 validated discord-safe (8/8 single q80 + Instagram
+                             # resize; 7/8 on a harsh double-reshare, amber the hard case).
+                             # Δ32 is quieter (~33%) but trades heavy-reshare robustness.
 _ASYM_FLOOR = 70             # min luma for a detectable "1" on near-black content
 _ASYM_BOX_RADIUS = 34        # px; box-blur radius for the per-column center (encode + decode).
                              # A box filter (integer-sum / one division), NOT a Gaussian:
@@ -209,12 +215,16 @@ def _asym_center_columns(img, w, h):
         px = img.getpixel((x, y))[:3]
         rr[x], gg[x], bb[x] = px[0], px[1], px[2]
     rr = _smooth1d(rr, _ASYM_BOX_RADIUS); gg = _smooth1d(gg, _ASYM_BOX_RADIUS); bb = _smooth1d(bb, _ASYM_BOX_RADIUS)
-    center_rgb = []; center_lum = []
+    center_rgb = []; center_val = []
     for x in range(w):
         r, g, b = _hue_floor(rr[x], gg[x], bb[x], _ASYM_FLOOR)
         center_rgb.append((r, g, b))
-        center_lum.append(0.299 * r + 0.587 * g + 0.114 * b)
-    return center_rgb, center_lum
+        # (R+G+B)/3, NOT luma — the decoder measures each bar pixel as (r+g+b)/3
+        # (see _decode_bits_at_scale), so the predicted "1" level must use the same
+        # metric. On coloured content luma and (r+g+b)/3 differ by ~10, which ate
+        # the margin at low delta; matching them restores the full delta/2 margin.
+        center_val.append((r + g + b) / 3.0)
+    return center_rgb, center_val
 
 
 def _asym_threshold_curve(img):
@@ -330,16 +340,21 @@ def _write_sequential(img, w, h, data_width, bits, bit_rgb, dom_r, dom_g, dom_b,
     header_overhead = 8
     rs_overhead = _RS_NSYM
 
-    ppb = _PIXELS_PER_BIT_WIDE
-    capacity_wide = (total_data_pixels // _PIXELS_PER_BIT_WIDE) // 8 - header_overhead - rs_overhead
-    if len(payload) > capacity_wide:
-        ppb = _PIXELS_PER_BIT_NARROW
-        capacity_narrow = (total_data_pixels // _PIXELS_PER_BIT_NARROW) // 8 - header_overhead - rs_overhead
-        if len(payload) > capacity_narrow:
-            raise ValueError(
-                f"Bar payload too large ({len(payload)}B) for image width "
-                f"({w}px, {capacity_narrow}B capacity at {ppb}px/bit)"
-            )
+    # Pick the WIDEST px/bit that fits (fatter bits = quieter + JPEG-tougher). The
+    # packed payload is what frees the room to widen past the old fixed 3. The
+    # decoder sweeps the same candidates widest-first and CRC/RS self-selects.
+    ppb = None
+    for cand in range(_PIXELS_PER_BIT_MAX, _PIXELS_PER_BIT_NARROW - 1, -1):
+        cap = (total_data_pixels // cand) // 8 - header_overhead - rs_overhead
+        if len(payload) <= cap:
+            ppb = cand
+            break
+    if ppb is None:
+        cap_narrow = (total_data_pixels // _PIXELS_PER_BIT_NARROW) // 8 - header_overhead - rs_overhead
+        raise ValueError(
+            f"Bar payload too large ({len(payload)}B) for image width "
+            f"({w}px, {cap_narrow}B capacity at {_PIXELS_PER_BIT_NARROW}px/bit)"
+        )
 
     bits_per_row = data_width // ppb
     for row_offset in range(_SIG_ROWS):
@@ -364,6 +379,29 @@ def _write_sequential(img, w, h, data_width, bits, bit_rgb, dom_r, dom_g, dom_b,
 # Encode
 # ---------------------------------------------------------------------------
 
+_HEXSET = frozenset('0123456789abcdef')
+
+
+def _pack_payload(identifier, content_hash):
+    """Build the bar payload bytes.
+
+    Canonical records (identifier ``<prefix>-<16 hex>`` + 16-hex content hash)
+    pack to BINARY: ``[prefix_len][prefix][8 id-bytes][8 hash-bytes]`` — ~16 bytes
+    smaller than the old ASCII-hex form, which is what buys fatter (quieter,
+    JPEG-tougher) bar bits. Non-canonical identifiers (e.g. raw-API content
+    addresses) fall back to the ASCII ``identifier\\x00hash`` form. The two are
+    self-distinguishing with no tag byte: the packed form's first byte is the
+    prefix length (3-10), the ASCII form's first byte is the identifier's leading
+    letter (>=65) — disjoint ranges.
+    """
+    pre, sep, idhex = identifier.rpartition('-')
+    if (sep and 3 <= len(pre) <= 10 and len(idhex) == 16
+            and _HEXSET.issuperset(idhex)
+            and len(content_hash) == 16 and _HEXSET.issuperset(content_hash)):
+        return bytes([len(pre)]) + pre.encode('utf-8') + bytes.fromhex(idhex) + bytes.fromhex(content_hash)
+    return f"{identifier}\x00{content_hash}".encode('utf-8')
+
+
 def embed_into(image, identifier, content_hash):
     """Write a Mememage bar into the bottom 2 rows of an image, IN MEMORY.
 
@@ -380,7 +418,7 @@ def embed_into(image, identifier, content_hash):
     Raises:
         ValueError: If the image is too narrow for the payload.
     """
-    payload = f"{identifier}\x00{content_hash}".encode('utf-8')
+    payload = _pack_payload(identifier, content_hash)
 
     # Fresh RGB copy — convert() always returns a new image, so the caller's
     # image is left untouched even when it's already RGB.
@@ -565,9 +603,10 @@ def _detect_bar(img):
 # ---------------------------------------------------------------------------
 
 # Even-fill frame byte-length sweep. Frame = 8B header + payload + 6B parity.
-# Payload = prefix(3-10) + '-' + 16hex + NUL + 16hex = 37..44B, so the frame is
-# 51..58B. The window has a little margin on both sides; CRC self-selects.
-_EVENFILL_MIN_BYTES = 49
+# Packed payload = prefix_len(1) + prefix(3-10) + 8B id + 8B hash = 20..27B, so a
+# packed frame is 34..41B. The ASCII fallback (non-canonical ids) can be larger,
+# so the window spans 33..64B with margin on both sides; CRC self-selects.
+_EVENFILL_MIN_BYTES = 33
 _EVENFILL_MAX_BYTES = 64
 
 
@@ -818,7 +857,9 @@ def extract_bar(image):
         if not scale_candidates:
             continue
         for scale in scale_candidates:
-            for ppb in [_PIXELS_PER_BIT_WIDE, _PIXELS_PER_BIT_NARROW]:
+            # Sweep px/bit widest-first (the encoder picks the widest that fits);
+            # CRC + RS self-select, so a wrong ppb just fails frame validation.
+            for ppb in range(_PIXELS_PER_BIT_MAX, _PIXELS_PER_BIT_NARROW - 1, -1):
                 bits = _decode_bits_at_scale(img, scale, ppb, threshold)
                 result = _try_decode_frame(bits)
                 if result is not None:
@@ -892,10 +933,24 @@ def _bits_to_bytes(bits):
 def _parse_payload(payload_bytes):
     """Parse a decoded payload into (identifier, content_hash) or None.
 
-    Handles both formats:
-      New: identifier\\x00hash (source-agnostic)
-      Old: <url>/<id>/record.json\\x00hash (legacy URL payload, backward compat)
+    Handles three forms (self-distinguishing, see :func:`_pack_payload`):
+      Packed:  [prefix_len 3-10][prefix][8 id-bytes][8 hash-bytes]  (canonical)
+      ASCII:   identifier\\x00hash                                   (non-canonical / raw API)
+      Legacy:  <url>/<id>/record.json\\x00hash                       (old URL payload)
     """
+    if not payload_bytes:
+        return None
+    n = payload_bytes[0]
+    if 3 <= n <= 10 and len(payload_bytes) >= 1 + n + 16:
+        # Packed binary form — first byte is the prefix length.
+        try:
+            prefix = payload_bytes[1:1 + n].decode('utf-8')
+        except UnicodeDecodeError:
+            prefix = None
+        if prefix is not None:
+            idhex = payload_bytes[1 + n:1 + n + 8].hex()
+            hashhex = payload_bytes[1 + n + 8:1 + n + 16].hex()
+            return f"{prefix}-{idhex}", hashhex
     try:
         text = payload_bytes.decode('utf-8')
     except UnicodeDecodeError:
