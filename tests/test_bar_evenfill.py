@@ -103,7 +103,15 @@ def test_512_overlong_prefix_raises(tmp_path):
 
 # --- downscale resilience (even-fill, high res) --------------------------
 
-@pytest.mark.parametrize("scale", [0.9, 0.75, 0.5, 0.4])
+# Asym camo (default since 2026-06-23) trades aggressive CLEAN-downscale
+# resilience for a near-invisible data strip: its per-column "1" level is
+# re-predicted from the row above the bar, and that prediction aliases under
+# heavy lossless resampling. Reliable clean-downscale floor is ~0.9x (was ~0.4x
+# for the centered scheme). The REALISTIC path — downscale + JPEG, which is how
+# every platform actually shrinks — is unaffected (test_downscale_plus_jpeg
+# survives 0.66x + q50). Lifting the clean-downscale floor is a known future bar
+# improvement; see memory project_bar_data_camouflage.
+@pytest.mark.parametrize("scale", [0.95, 0.9])
 def test_downscale_clean(tmp_path, scale):
     p = _embed(tmp_path, 4096, 2304)
     img = Image.open(p).convert("RGB")

@@ -408,15 +408,14 @@ def embed_into(image, identifier, content_hash):
 
     data_width = w - _HEADER_PIXELS - _FOOTER_PIXELS
 
-    # Layout decides the bit-painting scheme. Asym camo is used ONLY for the
-    # sequential layout — its data pixels copy image content, which can be M/Y/C-
-    # hued and would masquerade as the flush bands, fooling the band-EDGE finders
-    # that even-fill decode depends on for anchoring. Sequential at 1:1 reads from
-    # fixed pixel positions (no band-edge dependence), so asym is safe there. The
-    # even-fill regime (large images) keeps the centered gray scheme, whose data
-    # never resembles a band, preserving its drift-free downscale anchoring.
+    # Asym camo applies to BOTH layouts. Its data pixels copy image content,
+    # which can be M/Y/C-hued and would masquerade as the flush bands — but the
+    # band-edge finders no longer measure the data-adjacent edge by running into
+    # the data (they COMPUTE it from the data-free magenta/cyan span; see
+    # _find_header_end), so content-coloured data can't fool the anchoring that
+    # even-fill decode depends on. Sequential at 1:1 reads from fixed positions.
     is_even_fill = data_width >= _PIXELS_PER_BIT_WIDE * len(bits)
-    use_asym = _ASYM_ENCODE and not is_even_fill
+    use_asym = _ASYM_ENCODE
 
     # Dominant color from local context (legacy/centered scheme + sequential sig).
     dom_r, dom_g, dom_b = _dominant_color(img)
@@ -575,8 +574,13 @@ _EVENFILL_MAX_BYTES = 64
 def _find_header_end(img, y, w):
     """Return x just past the header's M->Y->C run (where data starts), or None.
 
-    Scans from the left edge with small transition-skip tolerance for JPEG
-    smear between bands.
+    The data-adjacent edge is COMPUTED, not measured by running the cyan count
+    into the data: asym camo data pixels can be cyan-hued and would extend the
+    run past the true edge. ``mag_start`` (the image's left edge) and
+    ``cyan_start`` (bounded by yellow) never touch data, and the span between
+    them is exactly two band widths — so band_width = (cyan_start-mag_start)/2
+    and data_start = cyan_start + band_width. Small transition-skip tolerance
+    absorbs JPEG smear between bands; the caller's phase sweep absorbs ±1-2px.
     """
     def run(pred, x):
         n = 0
@@ -588,22 +592,30 @@ def _find_header_end(img, y, w):
     x = 0
     while x < w and x < 40 and not _is_magenta(*img.getpixel((x, y))[:3]):
         x += 1
+    mag_start = x
     x, nm = run(_is_magenta, x)
     while x < w and x < 60 and not _is_yellow(*img.getpixel((x, y))[:3]):
         x += 1
     x, ny = run(_is_yellow, x)
     while x < w and x < 80 and not _is_cyan(*img.getpixel((x, y))[:3]):
         x += 1
+    cyan_start = x
     x, nc = run(_is_cyan, x)
     if nm < 2 or ny < 2 or nc < 2:
         return None
-    return x
+    band_width = (cyan_start - mag_start) / 2.0
+    return int(round(cyan_start + band_width))
 
 
 def _find_footer_start(img, y, w):
     """Return x at the left edge of the footer's C/Y/M run (where data ends),
     or None. Scans inward from the right edge (footer order is C,Y,M, so from
-    the right it reads M->Y->C)."""
+    the right it reads M->Y->C).
+
+    Data-adjacent edge is COMPUTED (see :func:`_find_header_end`): ``mag_start``
+    (image right edge) and ``cyan_start`` (bounded by yellow) are data-free, so
+    band_width = (mag_start-cyan_start)/2 and the footer's data-side edge is
+    cyan_start - band_width + 1 (cyan_start is the rightmost cyan pixel)."""
     def run(pred, x):
         n = 0
         while x >= 0 and pred(*img.getpixel((x, y))[:3]):
@@ -614,16 +626,19 @@ def _find_footer_start(img, y, w):
     x = w - 1
     while x >= 0 and x > w - 40 and not _is_magenta(*img.getpixel((x, y))[:3]):
         x -= 1
+    mag_start = x
     x, nm = run(_is_magenta, x)
     while x >= 0 and x > w - 60 and not _is_yellow(*img.getpixel((x, y))[:3]):
         x -= 1
     x, ny = run(_is_yellow, x)
     while x >= 0 and x > w - 80 and not _is_cyan(*img.getpixel((x, y))[:3]):
         x -= 1
+    cyan_start = x
     x, nc = run(_is_cyan, x)
     if nm < 2 or ny < 2 or nc < 2:
         return None
-    return x + 1
+    band_width = (mag_start - cyan_start) / 2.0
+    return int(round(cyan_start - band_width)) + 1
 
 
 def _otsu_threshold(img):
