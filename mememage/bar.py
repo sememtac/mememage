@@ -193,14 +193,23 @@ def _smooth1d(values, radius):
 
 
 def _hue_floor(r, g, b, floor):
-    """Brighten a colour to a minimum luma, preserving hue; pitch-black -> gray."""
+    """Lift a colour to a minimum luma WITHOUT amplifying its tint.
+
+    Adds the luma deficit equally to each channel (additive lift), so the absolute
+    channel differences are preserved and the result is a *muted* lift of the
+    content's colour. A near-black blue (2,5,20) becomes (66,69,84) at luma 70 —
+    NOT a saturated (24,60,241). The old multiplicative scaling (r*floor/L) blew up
+    tiny tints in near-black content into bright saturated colours, which showed as
+    blue pixels in the bar over dark-blue regions (e.g. cave shadows). Adding the
+    same delta to each channel raises luma by exactly that delta, so luma still
+    reaches the floor; clamping only nudges luma a hair below on rare saturated
+    darks, and the decoder re-derives the identical value so it stays consistent.
+    """
     L = 0.299 * r + 0.587 * g + 0.114 * b
     if L >= floor:
         return r, g, b
-    if L < 2:
-        return float(floor), float(floor), float(floor)
-    s = floor / L
-    return min(255.0, r * s), min(255.0, g * s), min(255.0, b * s)
+    d = floor - L
+    return min(255.0, r + d), min(255.0, g + d), min(255.0, b + d)
 
 
 def _asym_center_columns(img, w, h):
