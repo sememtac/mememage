@@ -179,13 +179,21 @@ def main():
     pd.add_argument("--json", action="store_true", help="Machine-readable JSON output")
 
     args = p.parse_args()
-    if args.command == "encode":
-        cmd_encode(args)
-    elif args.command == "decode":
-        cmd_decode(args)
-    else:
-        p.print_help()
-        sys.exit(1)
+    try:
+        if args.command == "encode":
+            cmd_encode(args)
+        elif args.command == "decode":
+            cmd_decode(args)
+        else:
+            p.print_help()
+            sys.exit(1)
+    except BrokenPipeError:
+        # A downstream reader (head / less / grep -q) closed the pipe early.
+        # Redirect stdout to devnull so the interpreter's final flush doesn't
+        # re-raise, then exit cleanly. The standard CLI idiom (Python docs).
+        import os
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        sys.exit(0)
 
 
 if __name__ == "__main__":
