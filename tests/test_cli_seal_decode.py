@@ -30,14 +30,27 @@ def _png():
     return p
 
 
+def _record_path(stdout):
+    """The soul path `mememage encode` wrote — named {identifier}.soul, so we
+    read it from the output rather than guessing from the image name."""
+    for line in stdout.splitlines():
+        if "record:" in line:
+            return line.split("record:", 1)[1].strip()
+    return None
+
+
 @unittest.skipUnless(HAS_PIL, "Pillow required")
 class TestEncodeDecodeCli(unittest.TestCase):
     def test_encode_then_decode_verified(self):
         img = _png()
-        rec = os.path.splitext(img)[0] + ".json"
         r = _run("encode", img, "--field", "prompt=a river", "--field", "by=andy")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("identifier:", r.stdout)
+        rec = _record_path(r.stdout)
+        # Record is named by the IDENTIFIER, not the image name (.json for the
+        # core; .soul is reserved for the provenance chain).
+        self.assertTrue(os.path.basename(rec).startswith("mememage-"))
+        self.assertTrue(rec.endswith(".json"))
         self.assertTrue(os.path.exists(rec))
 
         d = _run("decode", img, "--record", rec)
@@ -66,8 +79,8 @@ class TestEncodeDecodeCli(unittest.TestCase):
 
     def test_decode_json_output(self):
         img = _png()
-        rec = os.path.splitext(img)[0] + ".json"
-        _run("encode", img, "--field", "prompt=p")
+        r = _run("encode", img, "--field", "prompt=p")
+        rec = _record_path(r.stdout)
         d = _run("decode", img, "--record", rec, "--json")
         self.assertEqual(d.returncode, 0, d.stderr)
         obj = json.loads(d.stdout)
@@ -76,8 +89,8 @@ class TestEncodeDecodeCli(unittest.TestCase):
 
     def test_decode_tampered_exits_nonzero(self):
         img = _png()
-        rec_path = os.path.splitext(img)[0] + ".json"
-        _run("encode", img, "--field", "prompt=p")
+        r = _run("encode", img, "--field", "prompt=p")
+        rec_path = _record_path(r.stdout)
         rec = json.load(open(rec_path, encoding="utf-8"))
         rec["prompt"] = "TAMPERED"
         bad = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
@@ -106,11 +119,11 @@ class TestEncodeDecodeCli(unittest.TestCase):
         except Exception:
             self.skipTest("crypto unavailable")
         img = _png()
-        rec = os.path.splitext(img)[0] + ".json"
         env = dict(os.environ, MM_PW="swordfish")
         r = _run("encode", img, "--field", "title=pub", "--field", "gps=1,2",
                  "--private", "gps", "--password-env", "MM_PW", env=env)
         self.assertEqual(r.returncode, 0, r.stderr)
+        rec = _record_path(r.stdout)
         obj = json.load(open(rec, encoding="utf-8"))
         self.assertIn("title", obj)
         self.assertNotIn("gps", obj)

@@ -25,6 +25,8 @@ dependencies = ["Pillow>=10.0"]
 [project.optional-dependencies]
 # Field encryption (encode(password=…) / unlock) — AES-256-GCM via PBKDF2.
 encrypt = ["cryptography>=41.0"]
+# HEIC input (iPhone photos). Pillow is already a base dep; this adds the decoder.
+heic = ["pillow-heif>=0.16"]
 dev = ["pytest>=7.0", "Pillow>=10.0", "cryptography>=41.0", "numpy>=1.24"]
 
 [project.urls]

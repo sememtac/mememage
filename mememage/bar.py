@@ -9,21 +9,33 @@ Frame format (Gen I):
     nsym = number of Reed-Solomon parity bytes (6 = corrects up to 3 byte errors).
     CRC-16 is computed over the full RS codeword (payload + parity).
 
-Payload (UTF-8):
-    <identifier>\x00<content_hash 16 hex chars>
-    Source-agnostic. The decoder resolves the identifier through search.
-    The content hash verifies whatever is found.
+Payload (packed binary):
+    [1B prefix_len][prefix ASCII][8B identifier][8B content_hash]
+    The identifier is canonical <prefix>-<16 hex> (prefix 3-10 chars); the
+    first byte is the prefix length, so the decoder reads the prefix back
+    directly. Source-agnostic: the identifier is a locator the decoder resolves
+    through search, and the content hash verifies whatever is found.
+    (_pack_payload / _parse_payload enforce this shape.)
 
 Bar layout per row:
     [M×8][Y×8][C×8][data pixels...][C×8][Y×8][M×8]
 
-Each pixel keeps the dominant HUE; the two bit levels are placed
-symmetrically around the local dominant BRIGHTNESS (dom ± _BAR_DELTA/2),
-so the bar sinks toward the image's own tone instead of glowing on dark
-images. The decoder recovers the per-image threshold by Otsu; legacy
-absolute bars (bit 0 → 64, bit 1 → 192) still decode via the fixed-128
-candidate. The 8-pixel-wide M/Y/C color bands survive JPEG DCT blocks
-and bracket the data.
+Each data bit rides a PER-COLUMN level that copies the smoothed content one
+row above the bar (asym row-3-copy camo): "1" IS that level (invisible), "0"
+is _ASYM_DELTA below it. On dark content the level is lifted toward _ASYM_FLOOR
+by a saturation-capped floor so the mark stays detectable without a colour pop.
+The decoder re-predicts the same per-column threshold from the row above. The
+8-pixel-wide M/Y/C color bands survive JPEG DCT blocks and bracket the data.
+
+Because each bit is encoded RELATIVE to the content row above the bar, the bar
+is effectively 3 rows of context, not 2: the 2 data rows PLUS that 1 reference
+row. To EXTRACT or RELOCATE a working bar you must carry all 3 rows — the 2 data
+rows on their own do not decode (their per-column reference is gone), and
+``embed_into`` rejects an image under 3px tall for the same reason. This is
+deliberate, not a quirk: a bare bar cannot be transplanted onto another image
+(it won't decode without its original reference), and a 3-row transplant onto a
+*different* image is independently caught by the EMBODIED portrait/luma-grid
+check. The bar is woven into the flesh, not stuck on as a peelable label.
 
 Two width-adaptive layouts share that frame format (the choice is
 capacity-emergent — no flag, no version bump):
@@ -38,13 +50,14 @@ capacity-emergent — no flag, no version bump):
     so positional drift cannot accumulate across the width.
 
   * Sequential (small images, below the crossover): the frame is split across
-    the two rows at an integer px/bit (3, falling back to 2). Byte-identical
-    to the original layout, so small images and all pre-existing bars are
-    unchanged. The decoder estimates scale from band width and sweeps.
+    the two rows at the WIDEST integer px/bit that fits, swept 6 down to 2
+    (fatter is quieter and tougher under JPEG). The decoder estimates scale
+    from band width and sweeps px/bit widest-first.
 
-The decoder tries even-fill first, then the legacy scale-swept sequential
-read; both self-validate via CRC + Reed-Solomon, so the data selects the
-correct one.
+The decoder tries even-fill first, then the scale-swept sequential read; both
+self-validate via CRC + Reed-Solomon, so the data selects the correct one. (The
+public `extract_bar` adds a vertical-scan fallback that finds the bar at any
+height — see its docstring; this module note describes the in-place read.)
 """
 
 import struct
@@ -101,48 +114,37 @@ _HEADER_PIXELS = 3 * _HEADER_BAND  # total header width (24px)
 _FOOTER_PIXELS = 3 * _HEADER_BAND  # total footer width (24px)
 _HEADER_COLORS = [(255, 0, 255), (255, 255, 0), (0, 255, 255)]
 _FOOTER_COLORS = [(0, 255, 255), (255, 255, 0), (255, 0, 255)]
-_LOCAL_CONTEXT_ROWS = 6
 
 _PIXELS_PER_BIT_WIDE = 3       # crossover ppb: even-fill triggers at data_width >= this * n_bits
 _PIXELS_PER_BIT_NARROW = 2    # 2px/bit for narrower images (768px portraits)
 _PIXELS_PER_BIT_MAX = 6       # sequential picks the WIDEST ppb that fits (fatter = quieter +
                               # JPEG-tougher); the packed payload frees the room to widen.
-_RGB_TARGET_0 = 64           # legacy absolute levels — still read via the 128 candidate
-_RGB_TARGET_1 = 192
-_RGB_THRESHOLD = 128         # absolute decode candidate (legacy bars + always-present fallback)
-# --- Asym row-3-copy camouflage (Gen I, decode-compatible) --------------------
+_RGB_THRESHOLD = 128         # benign scalar default for the decode helpers' `threshold=` param
+                             # (the asym decode always passes its per-column curve explicitly)
+# --- Asym row-3-copy camouflage --------------------
 # The data bits ride a PER-COLUMN center that copies the smoothed content one row
-# ABOVE the bar (floored on dark, hue-preserving): a "1" bit IS that level
+# ABOVE the bar (floored on dark): a "1" bit IS that level
 # (so it reads as a continuation of the image — invisible), a "0" bit is darker
 # by _ASYM_DELTA, and filler past the payload is "1" (invisible). The decoder
 # never compares to the bar's own (asymmetric, biased) distribution — it
 # RE-PREDICTS the per-column "1" level from the preserved row above and
-# thresholds delta/2 below it. That makes it robust (q35+, multi-pass, Discord,
-# worst-case noise validated) AND much quieter than the centered scheme.
-# Backward-compatible: a new decode CANDIDATE; legacy/centered bars still decode
-# on the Otsu/128 candidates. New mints get the quiet bar; existing are untouched.
-_ASYM_ENCODE = True
-_ASYM_DELTA = 40             # "0" sits this far below the per-column "1" level. Lowered
-                             # 48->40 (~17% quieter) — the packed payload's fatter bits give
-                             # the room. Δ40 validated discord-safe (8/8 single q80 + Instagram
-                             # resize; 7/8 on a harsh double-reshare, amber the hard case).
-                             # Δ32 is quieter (~33%) but trades heavy-reshare robustness.
-_ASYM_FLOOR = 70             # min luma for a detectable "1" on near-black content
+# thresholds delta/2 below it. Robust (q35+, multi-pass, Discord, worst-case
+# noise validated) AND near-invisible.
+_ASYM_DELTA = 40             # "0" sits this far below the per-column "1" level. The
+                             # quieter<->tougher knob: 40 is Discord-safe; lower is quieter but
+                             # loses margin under a heavy re-share.
+_ASYM_FLOOR = 50             # min luma for a detectable "1" on dark content. The
+                             # saturation-capped _hue_floor keeps the dark mark hue-neutral and
+                             # JPEG-stable, so the floor can stay this low (dimmer bar); 45 is
+                             # the cliff.
+_FLOOR_SCALE_CAP = 2.0       # max multiplicative scale in _hue_floor before the
+                             # lift goes additive (near-black -> hue-neutral, not saturated).
 _ASYM_BOX_RADIUS = 34        # px; box-blur radius for the per-column center (encode + decode).
                              # A box filter (integer-sum / one division), NOT a Gaussian:
                              # math.exp diverges by 1 ULP between glibc and V8, which would
                              # break byte-exact writer parity (tests/bar_encode_parity.cjs).
                              # A box filter is IEEE-deterministic across runtimes. Radius 34
                              # (window 69) approximates the prior sigma-20 Gaussian support.
-
-_BAR_DELTA = 64              # centered scheme (legacy/fallback): bit-0/bit-1 separation (dom ± 32).
-                             # Lowered from 96 to camouflage the data strip (~33% quieter, and
-                             # the "1" bits on dark content drop from ~96 to ~64). 64 is the
-                             # measured floor that still survives JPEG q50 on a WORST-CASE
-                             # full-width-noise image (56 fails q50). Otsu decode is adaptive +
-                             # RS covers the rest, so no decoder change and legacy 96-delta
-                             # bars still decode. New mints get quieter bars; existing
-                             # bars are unaffected.
 
 
 
@@ -193,28 +195,37 @@ def _smooth1d(values, radius):
 
 
 def _hue_floor(r, g, b, floor):
-    """Brighten a colour to a minimum luma, PRESERVING HUE; pitch-black -> gray.
+    """Lift a dark colour toward luma ``floor`` for a detectable "1" bit, capping
+    saturation so near-black tinted content doesn't pop.
 
-    Multiplicative scaling (r*floor/L) keeps the content's hue, so the floored "1"
-    bits match the colour of the dark content they sit on — better camouflage on
-    dark-but-coloured imagery (the common case) than a desaturated additive lift,
-    which reads as a grey streak that stands out. The tradeoff: on near-PURE-black
-    content with a faint tint (e.g. (2,5,20)) the scaling can amplify it into a
-    saturated colour. That's an accepted edge — keeping the hue wins overall.
+    Plain multiplicative scaling (r*floor/L) preserves hue, but on near-black
+    content with a faint tint the scale factor explodes (floor/L → large) and
+    amplifies the tint into a SATURATED mark that (a) visibly pops and (b) FAILS a
+    q80 share — its (R+G+B)/3 rides a chroma channel JPEG subsamples away. So the
+    scale is CAPPED at _FLOOR_SCALE_CAP and the rest of the lift is additive
+    (hue-neutral): moderately-dark colour keeps its hue (gentle multiplier, so it
+    still camouflages by colour), near-black goes neutral (cap + additive, no pop).
+    Pure arithmetic (×, +, min) — byte-exact across Python/V8 for JS parity.
     """
     L = 0.299 * r + 0.587 * g + 0.114 * b
     if L >= floor:
         return r, g, b
-    if L < 2:
-        return float(floor), float(floor), float(floor)
-    s = floor / L
-    return min(255.0, r * s), min(255.0, g * s), min(255.0, b * s)
+    s = min(floor / L, _FLOOR_SCALE_CAP) if L >= 2 else _FLOOR_SCALE_CAP
+    r2, g2, b2 = r * s, g * s, b * s
+    L2 = 0.299 * r2 + 0.587 * g2 + 0.114 * b2
+    if L2 < floor:
+        k = floor - L2
+        r2, g2, b2 = r2 + k, g2 + k, b2 + k
+    return min(255.0, r2), min(255.0, g2), min(255.0, b2)
 
 
-def _asym_center_columns(img, w, h):
-    """Per-column (center_rgb, center_luma) for the asym scheme: the smoothed,
-    floored colour of the row immediately above the bar. The "1" bits copy this
-    (camouflage); "0" = center - delta. The decoder re-derives the same curve."""
+def _asym_levels_columns(img, w, h):
+    """Per-column ("1" rgb, "0" rgb, decode threshold) for the asym scheme.
+
+    One level = the smoothed, saturation-capped floored content (the "1"
+    camouflage), "0" = that minus _ASYM_DELTA, threshold = the midpoint. The
+    decoder re-derives the identical per-column curve from the preserved row above,
+    so it never disagrees with the writer."""
     y = h - _SIG_ROWS - 1                  # row immediately above the 2 bar rows
     if y < 0:
         y = max(0, h - 1)
@@ -223,26 +234,23 @@ def _asym_center_columns(img, w, h):
         px = img.getpixel((x, y))[:3]
         rr[x], gg[x], bb[x] = px[0], px[1], px[2]
     rr = _smooth1d(rr, _ASYM_BOX_RADIUS); gg = _smooth1d(gg, _ASYM_BOX_RADIUS); bb = _smooth1d(bb, _ASYM_BOX_RADIUS)
-    center_rgb = []; center_val = []
+    d = _ASYM_DELTA
+    one_rgb = []; zero_rgb = []; thr = []
     for x in range(w):
-        r, g, b = _hue_floor(rr[x], gg[x], bb[x], _ASYM_FLOOR)
-        center_rgb.append((r, g, b))
-        # (R+G+B)/3, NOT luma — the decoder measures each bar pixel as (r+g+b)/3
-        # (see _decode_bits_at_scale), so the predicted "1" level must use the same
-        # metric. On coloured content luma and (r+g+b)/3 differ by ~10, which ate
-        # the margin at low delta; matching them restores the full delta/2 margin.
-        center_val.append((r + g + b) / 3.0)
-    return center_rgb, center_val
+        r, g, b = rr[x], gg[x], bb[x]
+        cr, cg, cb = _hue_floor(r, g, b, _ASYM_FLOOR)
+        one_rgb.append((cr, cg, cb))
+        zero_rgb.append((cr - d, cg - d, cb - d))
+        thr.append((cr + cg + cb) / 3.0 - d / 2.0)
+    return one_rgb, zero_rgb, thr
 
 
 def _asym_threshold_curve(img):
-    """Per-column decode threshold: the predicted "1" level (from the row above)
-    minus delta/2 — the midpoint between the "1" (=center) and "0" (=center-delta)
-    levels. Robust because it's re-derived from preserved content, not the bar."""
+    """Per-column decode threshold (midpoint between the "1" and "0" levels),
+    re-derived from preserved content (the row above), not the bar."""
     w, h = img.size
-    _, center_lum = _asym_center_columns(img, w, h)
-    half = _ASYM_DELTA / 2.0
-    return [center_lum[x] - half for x in range(w)]
+    _, _, thr = _asym_levels_columns(img, w, h)
+    return thr
 
 
 def _thr(threshold, px):
@@ -257,38 +265,6 @@ def _thr(threshold, px):
 
 # ---------------------------------------------------------------------------
 # Dominant color from local context
-# ---------------------------------------------------------------------------
-
-def _dominant_color(img, sig_rows=_SIG_ROWS):
-    """Mean color from the rows just above the signature bar."""
-    w, h = img.size
-    context_end = h - sig_rows
-    context_start = max(0, context_end - _LOCAL_CONTEXT_ROWS)
-    if context_end <= context_start:
-        # Very short image — whole image mean
-        total_r, total_g, total_b, count = 0, 0, 0, 0
-        for y in range(h):
-            for x in range(w):
-                r, g, b = img.getpixel((x, y))[:3]
-                total_r += r
-                total_g += g
-                total_b += b
-                count += 1
-        if count == 0:
-            return 128, 128, 128
-        return round(total_r / count), round(total_g / count), round(total_b / count)
-
-    total_r, total_g, total_b, count = 0, 0, 0, 0
-    for y in range(context_start, context_end):
-        for x in range(w):
-            r, g, b = img.getpixel((x, y))[:3]
-            total_r += r
-            total_g += g
-            total_b += b
-            count += 1
-    return round(total_r / count), round(total_g / count), round(total_b / count)
-
-
 # ---------------------------------------------------------------------------
 # M/Y/C band color predicates (shared by detect + even-fill anchoring)
 # ---------------------------------------------------------------------------
@@ -338,12 +314,9 @@ def _write_even_fill(img, w, h, bits, bit_rgb):
                 img.putpixel((x, y), bit_rgb(bits[i], x))
 
 
-def _write_sequential(img, w, h, data_width, bits, bit_rgb, dom_r, dom_g, dom_b, payload, filler_bit=0):
-    """Legacy/small-image layout: split the frame sequentially across the two
-    rows at an integer px/bit (3, falling back to 2 for narrow images). Kept
-    byte-identical to the original so small images and pre-existing bars are
-    unchanged.
-    """
+def _write_sequential(img, w, h, data_width, bits, bit_rgb, payload):
+    """Small-image layout: split the frame sequentially across the two rows at the
+    widest integer px/bit that fits (6 down to 2 for narrow images)."""
     total_data_pixels = _SIG_ROWS * data_width
     header_overhead = 8
     rs_overhead = _RS_NSYM
@@ -376,11 +349,11 @@ def _write_sequential(img, w, h, data_width, bits, bit_rgb, dom_r, dom_g, dom_b,
                 for px in range(ppb):
                     img.putpixel((base_x + px, y), bit_rgb(bits[bit_idx], base_x + px))
             else:
-                # Filler past the payload. Legacy: bit-0 level (clean Otsu
-                # bimodality). Asym: filler_bit=1 (copies row above = invisible).
+                # Filler past the payload = "1" (asym copies the row above =
+                # invisible).
                 for px in range(ppb):
                     if base_x + px < w - _FOOTER_PIXELS:
-                        img.putpixel((base_x + px, y), bit_rgb(filler_bit, base_x + px))
+                        img.putpixel((base_x + px, y), bit_rgb(1, base_x + px))
 
 
 # ---------------------------------------------------------------------------
@@ -391,23 +364,28 @@ _HEXSET = frozenset('0123456789abcdef')
 
 
 def _pack_payload(identifier, content_hash):
-    """Build the bar payload bytes.
+    """Pack the bar payload to BINARY: ``[prefix_len][prefix][8 id-bytes][8 hash-bytes]``.
 
-    Canonical records (identifier ``<prefix>-<16 hex>`` + 16-hex content hash)
-    pack to BINARY: ``[prefix_len][prefix][8 id-bytes][8 hash-bytes]`` — ~16 bytes
-    smaller than the old ASCII-hex form, which is what buys fatter (quieter,
-    JPEG-tougher) bar bits. Non-canonical identifiers (e.g. raw-API content
-    addresses) fall back to the ASCII ``identifier\\x00hash`` form. The two are
-    self-distinguishing with no tag byte: the packed form's first byte is the
-    prefix length (3-10), the ASCII form's first byte is the identifier's leading
-    letter (>=65) — disjoint ranges.
+    Identifiers are canonical ``<prefix>-<16 hex>`` (prefix 3-10 chars) and the
+    content hash is 16 hex — the only form Mememage stamps. The first byte is the
+    prefix length, which the decoder reads back directly. A non-canonical
+    identifier or hash is a programming error (``api.encode`` / ``mint`` only
+    produce canonical ones) and raises.
     """
     pre, sep, idhex = identifier.rpartition('-')
-    if (sep and 3 <= len(pre) <= 10 and len(idhex) == 16
+    if not (sep and 3 <= len(pre) <= 10 and len(idhex) == 16
             and _HEXSET.issuperset(idhex)
             and len(content_hash) == 16 and _HEXSET.issuperset(content_hash)):
-        return bytes([len(pre)]) + pre.encode('utf-8') + bytes.fromhex(idhex) + bytes.fromhex(content_hash)
-    return f"{identifier}\x00{content_hash}".encode('utf-8')
+        raise ValueError(
+            f"bar identifier must be canonical <prefix>-<16 hex> + 16-hex hash; "
+            f"got {identifier!r} / {content_hash!r}")
+    # Length byte = UTF-8 BYTE count, not the char count. It must match
+    # _parse_payload's byte-slice read AND codec.js's TextEncoder pack (which
+    # already uses the byte length). Identical to len(pre) for ASCII (the only
+    # charset the prefix validator allows today), so this is a no-op for every
+    # current identifier; it just stays correct if the charset ever widens.
+    pre_bytes = pre.encode('utf-8')
+    return bytes([len(pre_bytes)]) + pre_bytes + bytes.fromhex(idhex) + bytes.fromhex(content_hash)
 
 
 def embed_into(image, identifier, content_hash):
@@ -432,6 +410,17 @@ def embed_into(image, identifier, content_hash):
     # image is left untouched even when it's already RGB.
     img = _resolve_image(image).convert('RGB')
     w, h = img.size
+
+    # The asym camo reads a reference row immediately above the 2 bar rows
+    # (`h - _SIG_ROWS - 1`), so the bar needs at least one clean content row
+    # above it — a 3px-tall image (1 reference + 2 data) is the floor. Below
+    # that the reference clamps onto a bar row and the camo/decode degrade
+    # silently; fail loud instead, symmetric to the width check in the writers.
+    if h < _SIG_ROWS + 1:
+        raise ValueError(
+            f"Bar needs an image at least {_SIG_ROWS + 1}px tall "
+            f"({_SIG_ROWS} data rows + 1 reference row); got {h}px"
+        )
 
     # Build Gen I frame with Reed-Solomon error correction (frame format is
     # identical in both layouts below — only the pixel layout differs).
@@ -461,56 +450,34 @@ def embed_into(image, identifier, content_hash):
     # _find_header_end), so content-coloured data can't fool the anchoring that
     # even-fill decode depends on. Sequential at 1:1 reads from fixed positions.
     is_even_fill = data_width >= _PIXELS_PER_BIT_WIDE * len(bits)
-    use_asym = _ASYM_ENCODE
 
-    # Dominant color from local context (legacy/centered scheme + sequential sig).
-    dom_r, dom_g, dom_b = _dominant_color(img)
-    dom_avg = (dom_r + dom_g + dom_b) / 3
+    # Asym camouflage: each bit rides PER-COLUMN levels derived from the smoothed
+    # content one row above (see _asym_levels_columns). Filler past the payload =
+    # "1". The decoder re-derives the same levels from the row above, so it never
+    # disagrees with the writer. The data pixels copy image content, which can be
+    # M/Y/C-hued and would masquerade as the flush bands — but the band-edge
+    # finders COMPUTE the data-adjacent edge from the data-free magenta/cyan span
+    # (see _find_header_end), so content-coloured data can't fool the anchoring.
+    _one_rgb, _zero_rgb, _ = _asym_levels_columns(img, w, h)
 
-    if use_asym:
-        # Asym camouflage: each bit rides a PER-COLUMN center that copies the
-        # smoothed, floored content one row above. "1" = center (invisible),
-        # "0" = center - delta. Filler past the payload = "1" (invisible). The
-        # decoder re-derives the center from the row above (see _asym_*).
-        _center_rgb, _center_lum = _asym_center_columns(img, w, h)
-        _filler_bit = 1
-
-        def _bit_rgb(bit, x):
-            cr, cg, cb = _center_rgb[x]
-            if bit:
-                return (round(cr), round(cg), round(cb))
-            return (max(0, round(cr - _ASYM_DELTA)),
-                    max(0, round(cg - _ASYM_DELTA)),
-                    max(0, round(cb - _ASYM_DELTA)))
-    else:
-        # Centered brightness (legacy): keep the dominant hue, place the two bit
-        # levels symmetrically around ONE clamped global dominant brightness.
-        _half = _BAR_DELTA / 2.0
-        _center = max(_half, min(255 - _half, dom_avg))
-        _lo, _hi = _center - _half, _center + _half
-        _filler_bit = 0
-
-        def _bit_rgb(bit, x=None):
-            target_avg = _hi if bit else _lo
-            offset = target_avg - dom_avg
-            return (max(0, min(255, round(dom_r + offset))),
-                    max(0, min(255, round(dom_g + offset))),
-                    max(0, min(255, round(dom_b + offset))))
+    def _bit_rgb(bit, x):
+        cr, cg, cb = _one_rgb[x] if bit else _zero_rgb[x]
+        return (max(0, min(255, round(cr))),
+                max(0, min(255, round(cg))),
+                max(0, min(255, round(cb))))
 
     # Layout choice is capacity-emergent, no flag or version bump:
     #   - Above the crossover (the whole frame fits in ONE row at >=3px/bit),
-    #     spread the bits to EVENLY FILL the full width between the flush
-    #     bilateral bands, and paint them 2px tall (both rows identical).
-    #     Fat bits => downscale resilience; the even fill => zero idle pixels;
-    #     the 2px height => vertical redundancy (survives a 1px bottom crop,
-    #     stronger under JPEG); both-end band anchoring => drift-free decode.
-    #   - Below the crossover (small images), fall back to the original
-    #     sequential split across the two rows (byte-identical to legacy).
+    #     spread the bits to EVENLY FILL the full width between the flush bands,
+    #     painted 2px tall (both rows identical): fat bits => downscale resilience,
+    #     even fill => zero idle pixels, 2px => 1px-crop survival, both-end
+    #     anchoring => drift-free decode.
+    #   - Below the crossover (small images), the sequential split across the two
+    #     rows at the widest px/bit that fits.
     if is_even_fill:
         _write_even_fill(img, w, h, bits, _bit_rgb)
     else:
-        _write_sequential(img, w, h, data_width, bits, _bit_rgb, dom_r, dom_g, dom_b,
-                          payload, filler_bit=_filler_bit)
+        _write_sequential(img, w, h, data_width, bits, _bit_rgb, payload)
 
     return img
 
@@ -545,11 +512,13 @@ def embed_bar(image_path, identifier, content_hash):
 # Detect
 # ---------------------------------------------------------------------------
 
-def _detect_bar(img):
-    """Check if the bottom row has the M/Y/C header pattern.
+def _detect_bar(img, y=None):
+    """Check if row ``y`` has the M/Y/C header pattern.
 
     Scans for the magenta→yellow→cyan transition to detect presence
     and measure the band width (reveals scale factor if resized).
+    ``y`` defaults to the bottom row (``h - 1``) — the embed position;
+    the vertical scan passes explicit rows to find a relocated bar.
 
     Returns (magenta_width, yellow_width, cyan_width) or None.
     """
@@ -557,7 +526,8 @@ def _detect_bar(img):
     if h < _SIG_ROWS or w < 20:
         return None
 
-    y = h - 1
+    if y is None:
+        y = h - 1
 
     def at(x):
         return img.getpixel((x, y))[:3]
@@ -612,8 +582,8 @@ def _detect_bar(img):
 
 # Even-fill frame byte-length sweep. Frame = 8B header + payload + 6B parity.
 # Packed payload = prefix_len(1) + prefix(3-10) + 8B id + 8B hash = 20..27B, so a
-# packed frame is 34..41B. The ASCII fallback (non-canonical ids) can be larger,
-# so the window spans 33..64B with margin on both sides; CRC self-selects.
+# packed frame is 34..41B. The window keeps generous margin (33..64B) so CRC/RS
+# self-select the true frame length; it is parity-locked to docs/js/data.js.
 _EVENFILL_MIN_BYTES = 33
 _EVENFILL_MAX_BYTES = 64
 
@@ -689,15 +659,14 @@ def _find_footer_start(img, y, w):
 
 
 def _otsu_threshold(img):
-    """Per-image bit threshold for the centered bar.
+    """Per-image bimodal bit threshold — a scalar fallback for the asym curve.
 
     Otsu over the middle 60% of the bottom rows (avoids the M/Y/C bands and is
     scale-robust — no fixed band-pixel offsets), returned as the MIDPOINT of the
-    two class means rather than the boundary index. The midpoint is what makes
-    this robust on an exact (lossless) bar, where the two levels are delta-spikes
-    and a boundary index would land *on* the bit-0 level and misread it. Returns
-    None on a degenerate (flat) region so the caller falls back to the absolute
-    128 candidate.
+    two class means rather than the boundary index (robust on an exact bar, where
+    the levels are delta-spikes). Rescues hard content (e.g. pure-saturated
+    backgrounds) where the asym per-column threshold's per-channel clamp shrinks
+    the (R+G+B)/3 margin. Returns None on a degenerate (flat) region.
     """
     try:
         w, h = img.size
@@ -795,16 +764,23 @@ def _decode_even_fill(img, threshold=_RGB_THRESHOLD):
     return None
 
 
-def extract_bar(image):
+def extract_bar(image, scan=True):
     """Extract identifier and content hash from a barred image.
 
-    Tries the high-res even-fill layout first (both-ends-anchored, drift-free),
-    then falls back to the legacy scale-swept sequential layout. Both self-
-    validate via CRC + Reed-Solomon, so the correct one is selected by the data.
+    The encoder always writes the bar into the bottom 2 rows, so this reads
+    that position first (the fast path). If ``scan`` is True and the bottom
+    read fails, it falls back to a vertical scan that finds the bar wherever
+    its M/Y/C band signature appears — so an image still decodes if the bar
+    was relocated, or content was appended below it, AFTER minting. (The
+    encoder never places the bar anywhere but the bottom; the scan only READS
+    one that something else moved.) CRC + Reed-Solomon self-select, so a
+    band-ish content row can't produce a false decode.
 
     Args:
         image: a path, raw bytes, a file-like object, a PIL Image, or a numpy
             array — anything :func:`_resolve_image` accepts (no disk required).
+        scan: fall back to the vertical scan when the bottom read fails
+            (default True). Pass False to read strictly the bottom 2 rows.
 
     Returns:
         (identifier, content_hash) tuple, or None if no valid bar found.
@@ -816,26 +792,212 @@ def extract_bar(image):
     except Exception:
         return None
 
-    # Brightness threshold candidates. The per-image Otsu midpoint reads the
-    # centered bar (levels hug the dominant brightness); the absolute 128 reads
-    # legacy absolute bars and is always present as a fallback. Otsu is tried
-    # first (it's the current scheme); CRC + Reed-Solomon self-select, so a wrong
-    # threshold just fails frame validation and the next candidate is tried.
+    result = _extract_at_bottom(img)
+    if result is not None:
+        return result
+    if scan:
+        for _, res in _scan_for_bars(img, first_only=True):
+            return res
+        # Last resort: the bar's canvas was extended (margins) or it was pasted
+        # into a larger image, so it's neither bottom-anchored nor full-width —
+        # find it by its band signature anywhere on the canvas.
+        for _, res in _scan_anywhere(img, first_only=True):
+            return res
+    return None
+
+
+def extract_bars(image):
+    """Find ALL valid bars in an image via vertical scan, de-duplicated.
+
+    The encoder emits a single bottom-anchored bar; this supports images that
+    carry several (e.g. stamped by different parties). Returns a list of
+    (identifier, content_hash), bottom-most first; empty list if none.
+    """
+    try:
+        img = _resolve_image(image)
+        if img.mode == 'RGBA':
+            img = img.convert('RGB')
+    except Exception:
+        return []
+    # Union of both scans so a single image can carry bars in MIXED placements
+    # — a bottom/full-width one (edge-anchored scan) alongside a relocated or
+    # pasted-in one (full-canvas scan). De-dup by (id, hash); edge-anchored
+    # first (cheaper, bottom-most first), then the anywhere fallback adds the
+    # off-position ones it didn't already surface.
+    results, seen = [], set()
+    for _, res in _scan_for_bars(img, first_only=False):
+        if res not in seen:
+            seen.add(res)
+            results.append(res)
+    for _, res in _scan_anywhere(img, first_only=False):
+        if res not in seen:
+            seen.add(res)
+            results.append(res)
+    return results
+
+
+# --- Full-canvas band search (locate a relocated/pasted bar anywhere) ---
+# The M/Y/C↔C/Y/M bands are a distinctive "data begins/ends here" fiducial.
+# _detect_bar (the fast gate) only reads them from the row's left edge; these
+# helpers scan a row's colour runs to find the header AND footer ANYWHERE, so a
+# bar whose canvas was extended (side/top/bottom margins) or that was pasted
+# into a larger image still decodes. The frame's magic + CRC + Reed-Solomon
+# reject a false band match downstream, so this only ever promotes a real bar.
+_HSPAN_MIN_RUN = 3   # min consecutive px per band segment (JPEG erodes 8 → ~4)
+
+
+def _row_color_runs(px, w, y):
+    """Maximal M/Y/C runs on row ``y`` as [(colour, start, length)]; any
+    non-band pixel breaks a run and is skipped."""
+    runs = []
+    x = 0
+    while x < w:
+        r, g, b = px[x, y][:3]
+        if _is_magenta(r, g, b):
+            c, pred = 'M', _is_magenta
+        elif _is_yellow(r, g, b):
+            c, pred = 'Y', _is_yellow
+        elif _is_cyan(r, g, b):
+            c, pred = 'C', _is_cyan
+        else:
+            x += 1
+            continue
+        j = x + 1
+        while j < w:
+            rr, gg, bb = px[j, y][:3]
+            if not pred(rr, gg, bb):
+                break
+            j += 1
+        runs.append((c, x, j - x))
+        x = j
+    return runs
+
+
+def _bar_span_candidates(img, y):
+    """Candidate (x0, x1) bar spans on row ``y`` from its bands, best-first.
+
+    Header is M→Y→C (flush left of the bar); footer is C→Y→M (flush right).
+    Adjacency (small inter-band gaps) rejects scattered content colours. A noisy
+    margin can still produce several plausible bands, so we return every
+    header×footer pairing, widest (most band-like) triples first, and let
+    CRC + RS pick the real bar. The caller caps total decode attempts.
+    """
+    w, h = img.size
+    if y < _SIG_ROWS or y >= h or w < 2 * _HSPAN_MIN_RUN * 3:
+        return []
+    px = img.load()
+    runs = [r for r in _row_color_runs(px, w, y) if r[2] >= _HSPAN_MIN_RUN]
+    if len(runs) < 6:   # need header (M,Y,C) + footer (C,Y,M)
+        return []
+
+    def adjacent(i, seq, maxgap=4):
+        for k in range(3):
+            if runs[i + k][0] != seq[k]:
+                return False
+        for k in range(2):
+            gap = runs[i + k + 1][1] - (runs[i + k][1] + runs[i + k][2])
+            if gap < 0 or gap > maxgap:
+                return False
+        return True
+
+    def width(i):
+        return runs[i][2] + runs[i + 1][2] + runs[i + 2][2]
+
+    headers = sorted((i for i in range(len(runs) - 2) if adjacent(i, ('M', 'Y', 'C'))),
+                     key=width, reverse=True)
+    footers = sorted((i for i in range(len(runs) - 2) if adjacent(i, ('C', 'Y', 'M'))),
+                     key=width, reverse=True)
+    out = []
+    for hi in headers:
+        x0 = runs[hi][1]
+        for fi in footers:
+            x1 = runs[fi + 2][1] + runs[fi + 2][2] - 1   # rightmost M pixel of footer
+            if x1 - x0 + 1 >= 2 * _HSPAN_MIN_RUN * 3 and (x0, x1) not in out:
+                out.append((x0, x1))
+    return out
+
+
+def _scan_anywhere(img, first_only):
+    """Fallback: find the bar by its band signature ANYWHERE on the canvas —
+    any row AND any horizontal offset/width — then crop to that span so the
+    existing bottom-path decode reads it flush. Handles a bar whose canvas was
+    extended (margins) or that was pasted into a larger image. Heavier than the
+    edge-anchored scan (a full-row band search + a few decode attempts per
+    candidate row), so callers run it only after the fast paths fail. CRC + RS
+    reject false band matches; a total-attempt cap bounds pathological inputs.
+    """
+    seen = set()
+    attempts = 0
+    y = img.size[1] - 1
+    while y >= _SIG_ROWS:
+        hit = False
+        for (x0, x1) in _bar_span_candidates(img, y):
+            attempts += 1
+            if attempts > 500:
+                return
+            res = _extract_at_bottom(img.crop((x0, 0, x1 + 1, y + 1)))
+            if res is not None:
+                hit = True
+                if res not in seen:
+                    seen.add(res)
+                    yield (y, res)
+                    if first_only:
+                        return
+                break
+        y -= _SIG_ROWS if hit else 1
+
+
+def _scan_for_bars(img, first_only):
+    """Yield (bottom_row, (identifier, content_hash)) for each row carrying the
+    M/Y/C band signature whose crop decodes; de-dups by (id, hash).
+
+    A cheap per-row band gate (no crop) rejects most rows; only on a match does
+    it crop so the candidate row pair sits at the bottom and run the REAL
+    bottom-path decode on that crop — so the asym reference lands on the row
+    above the bar, exactly as at the true bottom. Scans bottom-up.
+    """
+    w, h = img.size
+    seen = set()
+    y = h - 1
+    while y >= _SIG_ROWS:
+        if _detect_bar(img, y) is not None:
+            res = _extract_at_bottom(img.crop((0, 0, w, y + 1)))
+            if res is not None and res not in seen:
+                seen.add(res)
+                yield (y, res)
+                if first_only:
+                    return
+                y -= _SIG_ROWS   # skip this bar's partner (top) row
+                continue
+        y -= 1
+
+
+def _extract_at_bottom(img):
+    """Decode a bar at the bottom 2 rows of an already-resolved RGB ``img``.
+
+    Tries the high-res even-fill layout first (both-ends-anchored, drift-free),
+    then falls back to the legacy scale-swept sequential layout. Both self-
+    validate via CRC + Reed-Solomon, so the correct one is selected by the data.
+    Returns (identifier, content_hash) or None. The non-scanning core of
+    :func:`extract_bar`.
+    """
+    # Threshold candidates. The asym per-column curve (predicted "1" level minus
+    # delta/2, re-derived from the row above) is the PRIMARY — computed at the
+    # image's current resolution so the scale-swept read indexes it correctly.
+    # Otsu (the per-image bimodal midpoint) + the absolute 128 follow as scalar
+    # FALLBACKS that rescue hard content where the asym curve's per-channel clamp
+    # eats the delta margin (e.g. pure-saturated backgrounds, where "0"=center-Δ
+    # bottoms out on a 0/255 channel). CRC + Reed-Solomon self-select across the
+    # scale/ppb/offset sweep; the post-RS CRC re-check guards miscorrections.
     thresholds = []
-    otsu = _otsu_threshold(img)
-    if otsu is not None:
-        thresholds.append(otsu)
-    thresholds.append(_RGB_THRESHOLD)
-    # Asym camouflage bar — a PER-COLUMN threshold re-derived from the row above
-    # the bar (predicted "1" level minus delta/2). Tried after the scalar
-    # candidates so legacy/centered bars resolve first; asym bars fail the scalar
-    # candidates (their center varies per column) and resolve here. CRC+RS
-    # self-selects. The curve is computed at the image's current resolution, so
-    # the scale-swept sequential read indexes it correctly on downscaled images.
     try:
         thresholds.append(_asym_threshold_curve(img))
     except Exception:
         pass
+    otsu = _otsu_threshold(img)
+    if otsu is not None:
+        thresholds.append(otsu)
+    thresholds.append(_RGB_THRESHOLD)
 
     # Band detection is threshold-independent — do it once, reuse per candidate.
     # Scale 1:1 is ALWAYS tried (band detection isn't needed at native scale, and
@@ -939,42 +1101,23 @@ def _bits_to_bytes(bits):
 
 
 def _parse_payload(payload_bytes):
-    """Parse a decoded payload into (identifier, content_hash) or None.
+    """Parse a packed payload into (identifier, content_hash) or None.
 
-    Handles three forms (self-distinguishing, see :func:`_pack_payload`):
-      Packed:  [prefix_len 3-10][prefix][8 id-bytes][8 hash-bytes]  (canonical)
-      ASCII:   identifier\\x00hash                                   (non-canonical / raw API)
-      Legacy:  <url>/<id>/record.json\\x00hash                       (old URL payload)
+    Packed binary (the only form, see :func:`_pack_payload`):
+      [prefix_len 3-10][prefix][8 id-bytes][8 hash-bytes]
     """
     if not payload_bytes:
         return None
     n = payload_bytes[0]
-    if 3 <= n <= 10 and len(payload_bytes) >= 1 + n + 16:
-        # Packed binary form — first byte is the prefix length.
-        try:
-            prefix = payload_bytes[1:1 + n].decode('utf-8')
-        except UnicodeDecodeError:
-            prefix = None
-        if prefix is not None:
-            idhex = payload_bytes[1 + n:1 + n + 8].hex()
-            hashhex = payload_bytes[1 + n + 8:1 + n + 16].hex()
-            return f"{prefix}-{idhex}", hashhex
+    if not (3 <= n <= 10 and len(payload_bytes) >= 1 + n + 16):
+        return None
     try:
-        text = payload_bytes.decode('utf-8')
+        prefix = payload_bytes[1:1 + n].decode('utf-8')
     except UnicodeDecodeError:
         return None
-    if '\x00' not in text:
-        return None
-    first, content_hash = text.split('\x00', 1)
-    if '/' in first:
-        # Old format: URL — extract identifier
-        import re
-        match = re.search(r'mememage-[a-f0-9]+', first)
-        identifier = match.group(0) if match else first
-    else:
-        # New format: bare identifier
-        identifier = first
-    return identifier, content_hash
+    idhex = payload_bytes[1 + n:1 + n + 8].hex()
+    hashhex = payload_bytes[1 + n + 8:1 + n + 16].hex()
+    return f"{prefix}-{idhex}", hashhex
 
 
 def _try_decode_frame(bits):

@@ -101,7 +101,7 @@ def _validate_prefix(prefix: str) -> None:
     if not isinstance(prefix, str) or not _PREFIX_RE.match(prefix):
         raise ValueError(
             f"invalid prefix {prefix!r}: 3-10 chars, [A-Za-z][A-Za-z0-9_-]*"
-            "[A-Za-z0-9], IA-safe (the bar must fit a 512px image)")
+            "[A-Za-z0-9] — URL/path/filename-safe (the bar must fit a 512px image)")
 
 
 def _canonical(obj) -> str:
@@ -194,11 +194,20 @@ def encode(image, fields=None, *, prefix="mememage", identifier=None,
     record["hash_version"] = OPEN
 
     # Identity. Content-addressed from YOUR fields (stable whether or not you
-    # sign), unless you supplied one.
+    # sign), unless you supplied one. The bar carries a CANONICAL
+    # ``<prefix>-<16 hex>`` identifier, so an override must take that shape.
     ident = identifier
     if ident is None:
         _validate_prefix(prefix)
         ident = _content_identifier(fields, prefix)
+    else:
+        pre, sep, idhex = ident.rpartition("-")
+        if not (sep and len(idhex) == 16
+                and all(c in "0123456789abcdef" for c in idhex)):
+            raise ValueError(
+                f"identifier must be canonical <prefix>-<16 lower-hex>, got {ident!r}")
+        _validate_prefix(pre)   # a supplied identifier's prefix obeys the same
+                                # contract as the prefix= auto-path — one rule.
     record["identifier"] = ident
 
     # Field visibility — encrypt the private fields behind a password BEFORE the
@@ -254,17 +263,27 @@ def encode(image, fields=None, *, prefix="mememage", identifier=None,
     return Record(record=record, image_path=written, image=barred)
 
 
-def decode(image) -> "Bar | None":
-    """Read the bar's payload out of an image: ``Bar(identifier, content_hash)``
-    or None. The inverse of :func:`encode`.
+def decode(image, all_bars=False) -> "Bar | None | list[Bar]":
+    """Read the bar's payload out of an image. The inverse of :func:`encode`.
+
+    By default returns the FIRST (bottom-most) bar as ``Bar(identifier,
+    content_hash)``, or None — the common case: one image, one record.
+
+    With ``all_bars=True`` returns a LIST of *every* bar in the image (empty if
+    none) — for images stamped with more than one. Each bar is located wherever
+    it sits: the bottom (where :func:`encode` writes it), a different height,
+    horizontally offset, or pasted in from another image. CRC + Reed-Solomon
+    reject false matches, so bar-ish content never yields a spurious entry.
 
     ``image`` is anything in memory or on disk — a path, raw ``bytes``, a
     file-like object, a PIL ``Image``, or a numpy array. No network, no disk
-    round-trip: just the two values stamped in the pixels.
+    round-trip: just the values stamped in the pixels.
 
     The identifier points to a record you store separately; resolving it is yours
     (a dict, a file, a DB, a URL — core doesn't fetch). The content hash lets
     :func:`verify` confirm that record against the image."""
+    if all_bars:
+        return [Bar(identifier=i, content_hash=h) for (i, h) in bar.extract_bars(image)]
     result = bar.extract_bar(image)
     if not result:
         return None

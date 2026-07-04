@@ -10,14 +10,11 @@ each guess is. No password policy — any passphrase is accepted.
 """
 import os
 
-# Kept for backward compatibility with old records on disk; not emitted by the
-# current encryption pipeline.
-_SENTINEL = "[encrypted]"
 _PBKDF2_ITERATIONS = 600_000  # OWASP 2024 recommendation for SHA-256
 
 
 def is_encryption_available() -> bool:
-    """True if the cryptography library is installed (the ``[sign]`` extra)."""
+    """True if the cryptography library is installed (the ``[encrypt]`` extra)."""
     try:
         from cryptography.hazmat.primitives.ciphers.aead import AESGCM  # noqa: F401
         return True

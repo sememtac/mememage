@@ -85,7 +85,7 @@ def test_clean_roundtrip(tmp_path, w, h):
 
 # --- prefix length range at the 512 floor --------------------------------
 
-@pytest.mark.parametrize("prefix", ["mm", "abc", "mememage", "phoenix", "tencharsxx"])
+@pytest.mark.parametrize("prefix", ["mmm", "abc", "mememage", "phoenix", "tencharsxx"])
 def test_512_prefix_lengths(tmp_path, prefix):
     ident = f"{prefix}-a3f8c2d1e5b6f0a4"
     p = _embed(tmp_path, 512, 512, ident=ident, name=f"p_{prefix}.png")

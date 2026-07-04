@@ -42,8 +42,8 @@ class TestBarRoundTrip(unittest.TestCase):
     def test_basic_round_trip(self):
         """embed_bar → extract_bar should recover URL and content hash."""
         path = _make_test_image()
-        identifier = "mememage-abc12345"
-        content_hash = "a1b2c3d4e5f6g7h8"
+        identifier = "mememage-abc1234500000000"
+        content_hash = "a1b2c3d4e5f60708"
 
         embed_bar(path, identifier, content_hash)
         result = extract_bar(path)
@@ -54,7 +54,7 @@ class TestBarRoundTrip(unittest.TestCase):
 
     def test_different_image_sizes(self):
         """Bar should work on various image widths (minimum ~1008px at 3px/bit)."""
-        identifier = "mememage-123456789abc"
+        identifier = "mememage-123456789abc0000"
         content_hash = "deadbeef12345678"
 
         for width in [1024, 1360, 1536, 2048]:
@@ -67,7 +67,7 @@ class TestBarRoundTrip(unittest.TestCase):
 
     def test_different_background_colors(self):
         """Bar should survive various dominant colors."""
-        identifier = "mememage-colortest"
+        identifier = "mememage-c0107e5700000000"
         content_hash = "0000111122223333"
 
         for color in [(0, 0, 0), (255, 255, 255), (255, 0, 0), (0, 128, 0), (50, 50, 50)]:
@@ -80,8 +80,8 @@ class TestBarRoundTrip(unittest.TestCase):
     def test_image_too_narrow(self):
         """Should raise ValueError if image can't hold payload."""
         path = _make_test_image(width=256, height=256)
-        identifier = "mememage-abc123456789"
-        content_hash = "a1b2c3d4e5f6g7h8"
+        identifier = "mememage-abc1234567890000"
+        content_hash = "a1b2c3d4e5f60708"
 
         with self.assertRaises(ValueError):
             embed_bar(path, identifier, content_hash)
@@ -97,7 +97,7 @@ class TestBarRoundTrip(unittest.TestCase):
     def test_v4_version_byte(self):
         """Encoded bar should use version 4 with RS parity."""
         path = _make_test_image()
-        identifier = "mememage-v4test00000"
+        identifier = "mememage-0440000000000000"
         content_hash = "aabbccdd11223344"
         embed_bar(path, identifier, content_hash)
 
@@ -131,7 +131,7 @@ class TestBarRoundTrip(unittest.TestCase):
         img.save(f.name)
         f.close()
 
-        identifier = "mememage-rgba12345678"
+        identifier = "mememage-50ba123456780000"
         content_hash = "ffffeeeeddddcccc"
         embed_bar(f.name, identifier, content_hash)
         result = extract_bar(f.name)
@@ -148,7 +148,7 @@ class TestBarRoundTrip(unittest.TestCase):
         img.save(f.name, pnginfo=pnginfo)
         f.close()
 
-        embed_bar(f.name, "mememage-meta12345678", "1234567890abcdef")
+        embed_bar(f.name, "mememage-0e7a123456780000", "1234567890abcdef")
 
         result_img = Image.open(f.name)
         self.assertIn("note", result_img.text)
@@ -186,7 +186,7 @@ class TestBarJPEGSurvival(unittest.TestCase):
     def test_survives_jpeg_q95(self):
         """Bar should survive high-quality JPEG recompression."""
         path = self._make_noisy_image()
-        identifier = "mememage-jpegtest00000"
+        identifier = "mememage-09e0e57000000000"
         content_hash = "1122334455667788"
         embed_bar(path, identifier, content_hash)
 
@@ -202,7 +202,7 @@ class TestBarJPEGSurvival(unittest.TestCase):
     def test_survives_jpeg_q50(self):
         """Bar should survive JPEG recompression at quality 50."""
         path = self._make_noisy_image()
-        identifier = "mememage-jpegq50test0"
+        identifier = "mememage-09e050e570000000"
         content_hash = "aabbccddee001122"
         embed_bar(path, identifier, content_hash)
 
@@ -245,7 +245,7 @@ class TestBarDownscaleAliasing(unittest.TestCase):
 
     def test_survives_aliasing_null_downscale(self):
         path = self._wide_bar_image()
-        identifier = "mememage-aliasnull00000"[:21]
+        identifier = "mememage-a11a500000000000"
         content_hash = "0f1e2d3c4b5a6978"
         embed_bar(path, identifier, content_hash)
         src = Image.open(path).convert('RGB')
@@ -273,7 +273,7 @@ class TestBarRSCorrection(unittest.TestCase):
         # even-fill under the packed-payload crossover; even-fill RS is covered by
         # the JPEG/downscale cases in test_bar_evenfill.py.)
         path = _make_test_image(width=768, height=768)
-        identifier = "mememage-rstest000000"
+        identifier = "mememage-005e570000000000"
         content_hash = "aabbccdd11223344"
         embed_bar(path, identifier, content_hash)
 
@@ -282,21 +282,25 @@ class TestBarRSCorrection(unittest.TestCase):
         assert clean is not None
 
         # Corrupt 3 data bytes by flipping pixel brightness in the bar.
-        # v4 header is 8 bytes, so byte offsets 12, 22, 32 are in the codeword.
+        # Gen I header is 8 bytes, so byte offsets 12, 22, 32 are in the codeword.
         from mememage.bar import (
             _HEADER_PIXELS, _FOOTER_PIXELS, _SIG_ROWS,
-            _PIXELS_PER_BIT_WIDE, _PIXELS_PER_BIT_NARROW, _RS_NSYM,
+            _PIXELS_PER_BIT_MAX, _PIXELS_PER_BIT_NARROW, _RS_NSYM, _pack_payload,
         )
 
         img = Image.open(path)
         w, h = img.size
 
-        # Determine which ppb was actually used
+        # Determine the ppb the writer used (widest that fits the PACKED payload —
+        # same sweep as _write_sequential).
         data_per_row = w - _HEADER_PIXELS - _FOOTER_PIXELS
         total_data = _SIG_ROWS * data_per_row
-        payload_str = identifier + "\x00" + content_hash
-        cap_wide = total_data // _PIXELS_PER_BIT_WIDE // 8 - 8 - _RS_NSYM
-        ppb = _PIXELS_PER_BIT_WIDE if len(payload_str) <= cap_wide else _PIXELS_PER_BIT_NARROW
+        payload = _pack_payload(identifier, content_hash)
+        ppb = _PIXELS_PER_BIT_NARROW
+        for cand in range(_PIXELS_PER_BIT_MAX, _PIXELS_PER_BIT_NARROW - 1, -1):
+            if len(payload) <= (total_data // cand) // 8 - 8 - _RS_NSYM:
+                ppb = cand
+                break
         bits_per_row = data_per_row // ppb
 
         # Corrupt frame bytes 12, 22, 32 (all in codeword, past header)

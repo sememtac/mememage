@@ -62,11 +62,12 @@ mememage.unlock(result, "hunter2")["gps"]                # '45.5,-122.6'
 ## Command line
 
 ```bash
-mememage encode photo.png --field title="Morning fog"   # writes photo.json
-mememage decode photo.jpg --record photo.json           # VERIFIED (exit 0) / ALTERED (exit 1)
-mememage decode photo.jpg                                # no record → just read the identifier
+mememage encode photo.png --field title="Morning fog" -o photo.json   # write the record
+mememage decode photo.jpg --record photo.json                         # VERIFIED (exit 0) / ALTERED (exit 1)
+mememage decode photo.jpg                                             # read the identifier only (no record)
 ```
 
+Without `-o`, the record is written next to the image as `<identifier>.json`.
 `decode` exits 0 on a match.
 
 ## License

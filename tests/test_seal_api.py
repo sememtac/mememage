@@ -195,6 +195,24 @@ class TestDecode(unittest.TestCase):
         self.assertIsNotNone(record)
         self.assertTrue(mememage.verify(img, record))
 
+    def test_decode_all_returns_every_bar(self):
+        # An image can carry more than one bar in any placement. decode(all_bars=True)
+        # returns every one; plain decode() returns the first (bottom-most).
+        from PIL import Image
+        from mememage import bar as _bar
+        canvas = Image.new("RGB", (900, 560), (40, 90, 120))
+        canvas.paste(_bar.embed_into(Image.new("RGB", (900, 60), (60, 110, 90)),
+                     "mememage-aaaaaaaaaaaaaaaa", "aaaaaaaaaaaaaaaa"), (0, 500))    # bottom, full width
+        canvas.paste(_bar.embed_into(Image.new("RGB", (600, 60), (110, 70, 130)),
+                     "mememage-bbbbbbbbbbbbbbbb", "bbbbbbbbbbbbbbbb"), (170, 180))  # offset + higher
+        bars = mememage.decode(canvas, all_bars=True)
+        self.assertEqual(sorted(b.identifier for b in bars),
+                         ["mememage-aaaaaaaaaaaaaaaa", "mememage-bbbbbbbbbbbbbbbb"])
+        self.assertEqual(mememage.decode(canvas).identifier, "mememage-aaaaaaaaaaaaaaaa")
+
+    def test_decode_all_empty_when_no_bar(self):
+        self.assertEqual(mememage.decode(_png(), all_bars=True), [])
+
 
 try:
     from mememage import crypto

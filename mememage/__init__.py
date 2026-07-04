@@ -15,6 +15,12 @@ fetch. Optional field encryption: ``encode(password=…, private=[…])``
 ``pip install mememage`` (Pillow included); add ``[encrypt]`` for field encryption.
 """
 
+try:
+    from importlib.metadata import version as _pkg_version
+    __version__ = _pkg_version("mememage")
+except Exception:  # running from a source tree that isn't installed
+    __version__ = "0.1.0"
+
 from mememage.api import (
     Bar, Record, Verification, decode, encode, is_encrypted, unlock, verify,
 )

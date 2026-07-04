@@ -1,8 +1,9 @@
 """Mememage core CLI — `encode` / `decode` from a shell.
 
-    mememage encode photo.png --field title="Morning fog"   # writes photo.json
-    mememage decode photo.jpg --record photo.json            # VERIFIED / ALTERED
+    mememage encode photo.png --field title="Morning fog" -o photo.json  # write the record
+    mememage decode photo.jpg --record photo.json                        # VERIFIED / ALTERED
 
+Without -o, the record is written next to the image as <identifier>.json.
 `decode` exits 0 only on a match, so it drops straight into a CI gate.
 """
 import argparse
@@ -70,7 +71,11 @@ def cmd_encode(args):
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
-    out = args.out or (os.path.splitext(args.image)[0] + ".json")
+    # Name the record by its IDENTIFIER (not the image), so a record is found
+    # by the code the bar carries. Plain .json for the core; .soul is the
+    # provenance chain's. Matches the main CLI.
+    out = args.out or os.path.join(
+        os.path.dirname(args.image), result.identifier + ".json")
     result.save(out)
     print(f"Encoded {args.image}")
     print(f"  image:        {result.image_path}")
@@ -160,7 +165,8 @@ def main():
                     help="Encrypt only these comma-separated fields (rest public)")
     pe.add_argument("--password-env", metavar="VAR",
                     help="Read the encrypt password from this env var (else prompt)")
-    pe.add_argument("-o", "--out", help="Record output path (default: <image>.json)")
+    pe.add_argument("-o", "--out",
+                    help="Record output path (default: <identifier>.json next to the image)")
 
     pd = sub.add_parser("decode", help="Read the bar (identifier + content hash); with --record, verify")
     pd.add_argument("image", help="Image to decode (PNG, JPEG, screenshot)")

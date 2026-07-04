@@ -24,9 +24,11 @@ def _normalize_for_hash(obj):
     if isinstance(obj, list):
         return [_normalize_for_hash(v) for v in obj]
     if isinstance(obj, float):
-        # Guard against NaN/Infinity which would break canonical JSON
+        # NaN/Infinity can't live in JSON, and the browser verifier would hash
+        # them as null while Python coerced them differently — reject loudly
+        # rather than bake a divergent or unloadable record.
         if obj != obj or obj == float('inf') or obj == float('-inf'):
-            return 0
+            raise ValueError("NaN and Infinity are not valid values in a record")
         # Whole floats to ints (1.0 → 1) to match JS JSON.stringify
         if obj == int(obj):
             return int(obj)
@@ -36,25 +38,17 @@ def _normalize_for_hash(obj):
     return obj
 
 
-def hash_fields(hashable: dict, stored: "str | None" = None) -> str:
+def hash_fields(hashable: dict) -> str:
     """Hash an already-filtered field dict → 16 hex chars.
 
     Canonical JSON (sorted keys, normalized floats, no whitespace) → SHA-256 →
-    first 16 hex. If ``stored`` is given and the normalized hash doesn't match it,
-    retry with un-normalized JSON (records minted before float normalization) and
-    return that if it matches — so historical records still verify.
+    first 16 hex. Byte-identical to the browser verifier (``docs/js/verify.js``),
+    so Python and JS can't drift.
     """
     normalized = _normalize_for_hash(hashable)
     canonical = json.dumps(normalized, sort_keys=True, separators=(",", ":"),
                            ensure_ascii=True)
-    result = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
-    if stored and result != stored:
-        raw_canonical = json.dumps(hashable, sort_keys=True, separators=(",", ":"),
-                                   ensure_ascii=True)
-        raw_result = hashlib.sha256(raw_canonical.encode("utf-8")).hexdigest()[:16]
-        if raw_result == stored:
-            return raw_result
-    return result
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
 
 
 def open_hashable_fields(record: dict) -> dict:
@@ -71,4 +65,4 @@ def compute_content_hash(record: dict) -> str:
     ``_``-keys; first 16 hex. This is what ``encode`` bakes into the bar and what
     ``verify`` recomputes.
     """
-    return hash_fields(open_hashable_fields(record), record.get("content_hash"))
+    return hash_fields(open_hashable_fields(record))
