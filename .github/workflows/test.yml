@@ -1,8 +1,12 @@
 name: Tests
 
+# Core-package CI. Kept separate from the workshop repo's root test.yml, which
+# references full-repo-only modules (mememage.core) + tests that don't ship in
+# the allow-listed core package. publish-core.sh copies THIS file.
+
 on:
   push:
-    branches: [main, experiment]
+    branches: [main]
   pull_request:
     branches: [main]
 
@@ -23,14 +27,12 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install dependencies
-        run: |
-          pip install -e ".[dev]"
+        run: pip install -e ".[dev]"
 
       - name: Run tests
-        run: |
-          pytest tests/ --ignore=tests/test_decoder_site.py -q
+        run: pytest tests/ -q
 
-      - name: Verify package imports without optional deps
+      - name: Verify zero-dep import (no optional deps)
         run: |
           pip install --no-deps -e .
-          python -c "from mememage.core import compute_content_hash; print('zero-dep import OK')"
+          python -c "import mememage; from mememage import encode, decode, verify; from mememage.hashing import hash_fields; print('zero-dep import OK')"
