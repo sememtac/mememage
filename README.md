@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="https://mememage.art/img/mememage-icon.png" width="112" alt="Mememage">
+</p>
+
 # Mememage
 
 Encode an identifier into an image's pixels; verify a JSON record against any copy.
