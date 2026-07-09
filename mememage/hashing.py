@@ -42,8 +42,9 @@ def hash_fields(hashable: dict) -> str:
     """Hash an already-filtered field dict → 16 hex chars.
 
     Canonical JSON (sorted keys, normalized floats, no whitespace) → SHA-256 →
-    first 16 hex. Byte-identical to the browser verifier (``docs/js/verify.js``),
-    so Python and JS can't drift.
+    first 16 hex. Byte-identical to the companion browser verifier
+    (``verify.js`` in the core package; ``docs/js/verify.js`` in the reference
+    application), so Python and JS can't drift.
     """
     normalized = _normalize_for_hash(hashable)
     canonical = json.dumps(normalized, sort_keys=True, separators=(",", ":"),

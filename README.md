@@ -11,9 +11,11 @@ Mememage writes a 2-pixel-tall bar into the bottom rows of an image. The bar hol
 - **identifier** — a short string that points to a JSON record, stored separately (a server, a CDN, IPFS, a file).
 - **content hash** — a 64-bit digest (the first 16 hex of SHA-256) over the record. `verify` recomputes it and compares against the bar.
 
-**What's tamper-evident: the record.** Change any field and `verify` fails. Core proves the record-to-image *binding* — it does **not** police the pixels (edit the image but leave the bar, and it still verifies) and does **not** prove authorship (that's a signature's job, out of core's scope).
+**What's tamper-evident: the record.** Change any field and `verify` fails. Two keys sit outside the hash by design — `signature`, so a detached signature can attach later without re-hashing, and `_`-prefixed keys, reserved as unhashed scratch for decoders (`encode` refuses both as your field names). Core proves the record-to-image *binding* — it does **not** police the pixels (edit the image but leave the bar, and it still verifies) and does **not** prove authorship (that's a signature's job, out of core's scope).
 
-The bar survives JPEG, resaves, screenshots, and re-uploads, so the identifier reads back from any copy. `encode` reads any image Pillow can open and writes a lossless PNG; `decode` and `verify` work on any format the bar survives. Record fields are arbitrary — captions, credits, generation parameters, links.
+The bar survives JPEG, resaves, screenshots, and re-uploads, so the identifier reads back from a shared copy.
+
+**Downscaling is the limit.** An image ≥ ~1000px wide tolerates a modest shrink — to about 0.8× — plus one recompression, reliably (59 of 60 real-image round-trips across three resamplers and JPEG q70–q80). Past that, survival depends on the image: some content decodes at half size, some doesn't. Below 0.5× nothing decodes at any size — the colour bands that anchor the read are gone. Images under ~1000px wide use a denser layout and aren't promised any downscale. `encode` reads any image Pillow can open and writes a lossless PNG; `decode` and `verify` work on any format the bar survives. Record fields are arbitrary — captions, credits, generation parameters, links — apart from a few names reserved for the format itself (`identifier`, `content_hash`, `hash_version`, `signature`, `encrypted_fields`).
 
 ```bash
 pip install mememage                 # encode / decode / verify — Pillow included
@@ -48,7 +50,7 @@ record = my_store[bar.identifier]        # your storage: a dict, a file, a DB, a
 mememage.verify("photo.jpg", record)     # True if the record matches the image
 ```
 
-- **`encode` accepts any image** — a path, `bytes`, a PIL `Image`, or a numpy array (HEIC needs the `[heic]` extra) — and returns the barred image as `Record.image`. Given a destination — a path (in place, or a `.png` sibling for non-PNG), `out=<path.png>`, or `out=<stream>` (e.g. `BytesIO`) — it writes the file. Output is always PNG: the bar is lossless, and a lossy re-encode would corrupt it. An in-memory input with no destination never touches disk.
+- **`encode` accepts any image** — a path, `bytes`, a file-like, a PIL `Image`, or a numpy array (HEIC needs the `[heic]` extra) — and returns the barred image as `Record.image`. Given a destination — a path (in place, or a `.png` sibling for non-PNG), `out=<path.png>`, or `out=<stream>` (e.g. `BytesIO`) — it writes the file. Output is always PNG: the bar is lossless, and a lossy re-encode would corrupt it. An in-memory input with no destination never touches disk.
 - **`decode` / `verify` accept the same in-memory forms** — a path, `bytes`, a file-like, a PIL `Image`, or a numpy array. No disk round-trip.
 - **No network I/O** — `decode` returns the identifier; you resolve the record. Core is pure pixel + hash operations.
 
@@ -74,7 +76,8 @@ mememage decode photo.jpg                                             # read the
 ```
 
 Without `-o`, the record is written next to the image as `<identifier>.json`.
-`decode` exits 0 on a match.
+With `--record`, `decode` exits 0 on a match and 1 on a mismatch; without it,
+exit 0 just means a bar was read.
 
 ## License
 

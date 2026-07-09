@@ -143,6 +143,55 @@ def test_downscale_plus_jpeg(tmp_path):
     assert bar.extract_bar(str(jp)) == EXPECT
 
 
+# --- 0.5x downscale + JPEG (soft-anchor regression pins) ------------------
+
+# Regression pins for the soft ordering predicates, NOT a universal 0.5x
+# promise. At 0.5x the 8px bands fall to 4px and JPEG 4:2:0 chroma
+# subsampling defeats the strict absolute cutoffs, so _find_header_end
+# returned None and 0.5x was unconditionally dead — these cases decode only
+# because of the soft fallback. Whether any *given* image survives 0.5x is
+# content-dependent (bit margin, a separate limit): a real-image corpus put
+# even-fill survival at 59/60 by 0.8x but far lower at 0.5x. The bar module
+# docstring states the honest envelope; these tests guard the anchor half.
+
+@pytest.mark.parametrize("q", [80, 70])
+def test_half_scale_plus_jpeg(tmp_path, q):
+    p = _embed(tmp_path, 2048, 1434)
+    img = Image.open(p).convert("RGB")
+    small = img.resize((1024, 717), Image.LANCZOS)
+    jp = tmp_path / "half.jpg"
+    _save_jpeg(small, jp, q)
+    assert bar.extract_bar(str(jp)) == EXPECT
+
+
+@pytest.mark.parametrize("resampler", [Image.BILINEAR, Image.BOX])
+def test_half_scale_plus_jpeg_resamplers(tmp_path, resampler):
+    # platforms differ in resampling kernel; the promise can't be
+    # LANCZOS-specific
+    p = _embed(tmp_path, 2048, 1434)
+    img = Image.open(p).convert("RGB")
+    small = img.resize((1024, 717), resampler)
+    jp = tmp_path / "half_r.jpg"
+    _save_jpeg(small, jp, 80)
+    assert bar.extract_bar(str(jp)) == EXPECT
+
+
+def test_soft_predicates_survive_chroma_dilution():
+    """The mechanism pin: chroma-smeared band pixels that fail the strict
+    absolute cutoffs (measured from a real 0.5x + q80 round-trip) still
+    classify correctly by channel ordering."""
+    # yellow band pixel after 0.5x + q80 4:2:0 — b crept to 122 (> 120)
+    assert not bar._is_yellow(241, 233, 122)
+    assert bar._is_yellow_soft(241, 233, 122)
+    # cyan band pixel after the same round-trip — r crept to 127 (> 120)
+    assert not bar._is_cyan(127, 202, 171)
+    assert bar._is_cyan_soft(127, 202, 171)
+    # soft stays selective: gray/white/skin-ish pixels match nothing
+    for px in [(128, 128, 128), (250, 250, 250), (220, 180, 150)]:
+        assert not (bar._is_magenta_soft(*px) or bar._is_yellow_soft(*px)
+                    or bar._is_cyan_soft(*px))
+
+
 # --- bottom 1px crop (vertical-redundancy payoff) ------------------------
 
 def test_bottom_1px_crop(tmp_path):

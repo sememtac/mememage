@@ -19,8 +19,9 @@ fetch. Optional field encryption: ``encode(password=…, private=[…])``
 try:
     from importlib.metadata import version as _pkg_version
     __version__ = _pkg_version("mememage")
-except Exception:  # running from a source tree that isn't installed
-    __version__ = "0.1.0"
+except Exception:  # running from a source tree that isn't installed —
+    # a sentinel, not a real version (pyproject.toml is the source of truth)
+    __version__ = "0.0.0"
 
 from mememage.api import (
     Bar, Record, Verification, decode, encode, is_encrypted, unlock, verify,

@@ -131,7 +131,9 @@ def encode(image, fields=None, *, prefix="mememage", identifier=None,
 
     Adds ``identifier``, ``content_hash`` and ``hash_version="open"`` to your
     fields, hashes everything (the ``open`` model — every field tamper-evident),
-    and embeds ``<identifier>\\0<content_hash>`` into the bottom two pixel rows.
+    and embeds the identifier + content hash into the bottom two pixel rows
+    (a packed binary payload — prefix + 8 raw identifier bytes + 8 raw hash
+    bytes — framed with CRC-16 + Reed-Solomon; see ``bar.py``).
 
     Reads **any image** — a path, raw ``bytes``, a file-like object, a PIL Image,
     or a numpy array (HEIC paths need the ``[heic]`` extra). The barred image is
@@ -150,8 +152,9 @@ def encode(image, fields=None, *, prefix="mememage", identifier=None,
     envelope (AES-256-GCM via PBKDF2). The content hash then covers the
     CIPHERTEXT — so the record still verifies *without* the password (the proof
     is over the encrypted shell), and tampering with the ciphertext breaks it.
-    Reveal the fields with :func:`unlock` (or in the browser decoder by typing the
-    password). The password is not stored; only the ciphertext is kept.
+    Reveal the fields with :func:`unlock` (the reference decoder web app — a
+    separate application, not part of this package — offers the same unlock in
+    the browser). The password is not stored; only the ciphertext is kept.
 
     Args:
         image: the source image — a path, bytes, a file-like, a PIL Image, or a
@@ -161,7 +164,8 @@ def encode(image, fields=None, *, prefix="mememage", identifier=None,
             signature/encrypted_fields) can't be passed.
         prefix: identifier namespace, 3-10 chars, IA-safe. Default ``mememage``.
         identifier: override the auto content-addressed identifier with your own
-            ``<prefix>-...`` string.
+            canonical ``<prefix>-<16 lower-hex>`` string (anything else raises
+            ``ValueError`` — the bar packs exactly that shape).
         password: encrypt private fields under this passphrase. Needs the
             [encrypt] extra (cryptography). None → fully public record.
         private: which field names to encrypt (list). With a password, ``None``
@@ -212,8 +216,10 @@ def encode(image, fields=None, *, prefix="mememage", identifier=None,
 
     # Field visibility — encrypt the private fields behind a password BEFORE the
     # hash, so the proof covers the ciphertext (tamper-evident shell; verifies
-    # without the password). The encrypted_fields envelope is AES-256-GCM and
-    # decryptable in any browser via SubtleCrypto.
+    # without the password). The encrypted_fields envelope is AES-256-GCM built
+    # from WebCrypto-compatible primitives (PBKDF2-HMAC-SHA256 + AES-GCM), so a
+    # browser can implement unlock via SubtleCrypto — the reference decoder web
+    # app does; the bundled verify.js is hash-only by design.
     if password is not None:
         from mememage import crypto
         if not crypto.is_encryption_available():
@@ -272,8 +278,9 @@ def decode(image, all_bars=False) -> "Bar | None | list[Bar]":
     With ``all_bars=True`` returns a LIST of *every* bar in the image (empty if
     none) — for images stamped with more than one. Each bar is located wherever
     it sits: the bottom (where :func:`encode` writes it), a different height,
-    horizontally offset, or pasted in from another image. CRC + Reed-Solomon
-    reject false matches, so bar-ish content never yields a spurious entry.
+    horizontally offset, or pasted in from another image. A spurious entry
+    would have to defeat the magic bytes, CRC-16, and Reed-Solomon checks at
+    once, so bar-ish content is rejected rather than misread.
 
     ``image`` is anything in memory or on disk — a path, raw ``bytes``, a
     file-like object, a PIL ``Image``, or a numpy array. No network, no disk

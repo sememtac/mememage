@@ -4,7 +4,8 @@
     mememage decode photo.jpg --record photo.json                        # VERIFIED / RECORD ALTERED
 
 Without -o, the record is written next to the image as <identifier>.json.
-`decode` exits 0 only on a match, so it drops straight into a CI gate.
+With --record, `decode` exits 0 only on a match, so it drops straight into
+a CI gate; without --record, exit 0 just means a bar was read.
 """
 import argparse
 import sys
@@ -151,7 +152,9 @@ def main():
     sub = p.add_subparsers(dest="command")
 
     pe = sub.add_parser("encode", help="Encode a bar + build a record from your fields")
-    pe.add_argument("image", help="PNG image to encode (modified in place)")
+    pe.add_argument("image", help="Image to encode (any format Pillow reads; "
+                                   "a PNG is barred in place, anything else "
+                                   "gets a .png sibling)")
     pe.add_argument("--field", action="append", metavar="KEY=VALUE",
                     help="A record field (repeatable). String values; use --fields for typed/nested.")
     pe.add_argument("--fields", metavar="JSON_FILE",

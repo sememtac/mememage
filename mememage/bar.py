@@ -1,8 +1,26 @@
 """Steganographic bar codec for minted images.
 
 Encodes an identifier and content hash into a 2-pixel-tall bar at the
-bottom of an image. Survives JPEG recompression (tested to q50),
-social media re-encoding, and platform pipeline conversion.
+bottom of an image. Survives JPEG recompression, social media
+re-encoding, and platform pipeline conversion (tested to q50 at typical
+sizes; small images — where bits are only 2-3px wide — have a tighter
+quality floor). Downscale + recompression has two independent limits:
+
+  * ANCHORS (hard): the 8px M/Y/C bands need >=4px post-scale, so nothing
+    decodes below 0.5x at any size. At exactly 0.5x the bands survive only
+    via the soft ordering predicates (see _BAND_PREDICATE_PASSES) — JPEG
+    chroma subsampling defeats the strict absolute cutoffs there.
+  * BIT MARGIN (soft, content-dependent): each bit needs ~3px post-scale,
+    i.e. (w - 48) * s >= 3 * n_bits — necessary but NOT sufficient. Even
+    with fat bits, saturated or high-frequency content near the bar can
+    lose the delta/2 margin under chroma subsampling and fail.
+
+What that buys, measured on 16 real images x 3 resamplers x JPEG q70-q80:
+even-fill images (>=~1000px wide) decode 60/60 at 0.9x and 59/60 at 0.8x.
+At 0.7x it's 50/60, and 0.5x is content-dependent — the soft-anchor
+fallback made it *reachable* (it was unconditionally dead before), not
+guaranteed. Do not promise 0.5x. Heavy double-reshares of a downscaled
+copy are outside the envelope.
 
 Frame format (Gen I):
     [2B magic 0xAD4E][1B gen=1][1B nsym][2B payload_len BE][2B CRC-16][RS(payload, nsym)]
@@ -116,7 +134,8 @@ _HEADER_COLORS = [(255, 0, 255), (255, 255, 0), (0, 255, 255)]
 _FOOTER_COLORS = [(0, 255, 255), (255, 255, 0), (255, 0, 255)]
 
 _PIXELS_PER_BIT_WIDE = 3       # crossover ppb: even-fill triggers at data_width >= this * n_bits
-_PIXELS_PER_BIT_NARROW = 2    # 2px/bit for narrower images (768px portraits)
+_PIXELS_PER_BIT_NARROW = 2    # sweep floor — the narrowest px/bit tried; only
+                              # very small images (~≤515px wide) land here
 _PIXELS_PER_BIT_MAX = 6       # sequential picks the WIDEST ppb that fits (fatter = quieter +
                               # JPEG-tougher); the packed payload frees the room to widen.
 _RGB_THRESHOLD = 128         # benign scalar default for the decode helpers' `threshold=` param
@@ -128,8 +147,10 @@ _RGB_THRESHOLD = 128         # benign scalar default for the decode helpers' `th
 # by _ASYM_DELTA, and filler past the payload is "1" (invisible). The decoder
 # never compares to the bar's own (asymmetric, biased) distribution — it
 # RE-PREDICTS the per-column "1" level from the preserved row above and
-# thresholds delta/2 below it. Robust (q35+, multi-pass, Discord, worst-case
-# noise validated) AND near-invisible.
+# thresholds delta/2 below it. Robust (Discord-tier shares and multi-pass
+# re-saves validated on real images; the quality floor is content- and
+# size-dependent — roughly q45-q50 at typical sizes, tighter on small
+# images) AND near-invisible.
 _ASYM_DELTA = 40             # "0" sits this far below the per-column "1" level. The
                              # quieter<->tougher knob: 40 is Discord-safe; lower is quieter but
                              # loses margin under a heavy re-share.
@@ -264,8 +285,6 @@ def _thr(threshold, px):
 
 
 # ---------------------------------------------------------------------------
-# Dominant color from local context
-# ---------------------------------------------------------------------------
 # M/Y/C band color predicates (shared by detect + even-fill anchoring)
 # ---------------------------------------------------------------------------
 
@@ -277,6 +296,30 @@ def _is_yellow(r, g, b):
 
 def _is_cyan(r, g, b):
     return r < 120 and g > 130 and b > 130
+
+
+# SOFT variants — relative channel dominance instead of absolute cutoffs.
+# JPEG 4:2:0 chroma subsampling smears a downscaled band's colour toward its
+# neighbours: at 0.5x the 8px bands are 4px, only ~2px of chroma survive, and
+# a pixel like (241, 233, 122) fails the strict yellow test (b < 120) by 2
+# while still being unmistakably yellow BY ORDERING (r-b=119, g-b=111). The
+# ordering margin survives dilution because subsampling shifts all of a
+# pixel's chroma together — it can't reorder the channels until the band is
+# blended nearly away. Used as a second-pass fallback by the band-edge
+# finders (strict first, so pristine images never take this path); any false
+# anchor it admits on band-coloured content is rejected downstream by the
+# magic + CRC-16 + RS frame checks, so the fallback is a strict decode-side
+# superset — same stance as the anchor-phase sweep.
+_SOFT_DOMINANCE = 40
+
+def _is_magenta_soft(r, g, b):
+    return r - g > _SOFT_DOMINANCE and b - g > _SOFT_DOMINANCE
+
+def _is_yellow_soft(r, g, b):
+    return r - b > _SOFT_DOMINANCE and g - b > _SOFT_DOMINANCE
+
+def _is_cyan_soft(r, g, b):
+    return g - r > _SOFT_DOMINANCE and b - r > _SOFT_DOMINANCE
 
 
 # ---------------------------------------------------------------------------
@@ -369,8 +412,9 @@ def _pack_payload(identifier, content_hash):
     Identifiers are canonical ``<prefix>-<16 hex>`` (prefix 3-10 chars) and the
     content hash is 16 hex — the only form Mememage stamps. The first byte is the
     prefix length, which the decoder reads back directly. A non-canonical
-    identifier or hash is a programming error (``api.encode`` / ``mint`` only
-    produce canonical ones) and raises.
+    identifier or hash is a programming error (``api.encode`` — and the
+    reference application's mint pipeline — only produce canonical ones)
+    and raises.
     """
     pre, sep, idhex = identifier.rpartition('-')
     if not (sep and 3 <= len(pre) <= 10 and len(idhex) == 16
@@ -383,7 +427,9 @@ def _pack_payload(identifier, content_hash):
     # _parse_payload's byte-slice read AND codec.js's TextEncoder pack (which
     # already uses the byte length). Identical to len(pre) for ASCII (the only
     # charset the prefix validator allows today), so this is a no-op for every
-    # current identifier; it just stays correct if the charset ever widens.
+    # current identifier. (If the charset ever widens, the byte count here
+    # stays correct but _parse_payload's 3-10 length bound must widen too —
+    # a multi-byte prefix can exceed 10 bytes at ≤10 chars.)
     pre_bytes = pre.encode('utf-8')
     return bytes([len(pre_bytes)]) + pre_bytes + bytes.fromhex(idhex) + bytes.fromhex(content_hash)
 
@@ -398,11 +444,13 @@ def embed_into(image, identifier, content_hash):
 
     Args:
         image: the source image (any in-memory or on-disk form).
-        identifier: Mememage identifier (e.g. "mememage-a3f8c2d1e5b6").
+        identifier: canonical Mememage identifier, ``<prefix>-<16 hex>``
+            (e.g. "mememage-a3f8c2d1e5b60718").
         content_hash: 16 hex char content hash.
 
     Raises:
-        ValueError: If the image is too narrow for the payload.
+        ValueError: If the image is too narrow for the payload, shorter
+            than 3px, or the identifier/hash isn't canonical.
     """
     payload = _pack_payload(identifier, content_hash)
 
@@ -588,6 +636,22 @@ _EVENFILL_MIN_BYTES = 33
 _EVENFILL_MAX_BYTES = 64
 
 
+# The strict M/Y/C predicates first, then the soft (channel-ordering)
+# fallback. Strict-first means a pristine or lightly-compressed image
+# resolves exactly as before at zero added cost; the soft pass only runs
+# when strict finds nothing — the chroma-subsampled-downscale regime
+# (e.g. 0.5x + JPEG, where the 4px bands fail the absolute cutoffs but
+# keep their channel ordering). A soft false-anchor on band-coloured
+# content is harmless: the frame's magic + CRC-16 + RS checks reject it.
+# NOTE: docs/js/codec.js mirrors these finders with strict predicates only —
+# port the soft pass there at the next decoder unseal (decode-capability
+# parity; the writer is untouched, so byte-exact writer parity is unaffected).
+_BAND_PREDICATE_PASSES = (
+    (_is_magenta, _is_yellow, _is_cyan),
+    (_is_magenta_soft, _is_yellow_soft, _is_cyan_soft),
+)
+
+
 def _find_header_end(img, y, w):
     """Return x just past the header's M->Y->C run (where data starts), or None.
 
@@ -598,7 +662,17 @@ def _find_header_end(img, y, w):
     them is exactly two band widths — so band_width = (cyan_start-mag_start)/2
     and data_start = cyan_start + band_width. Small transition-skip tolerance
     absorbs JPEG smear between bands; the caller's phase sweep absorbs ±1-2px.
+    Tries the strict predicates first, then the soft ordering fallback (see
+    ``_BAND_PREDICATE_PASSES``).
     """
+    for is_m, is_y, is_c in _BAND_PREDICATE_PASSES:
+        r = _find_header_end_with(img, y, w, is_m, is_y, is_c)
+        if r is not None:
+            return r
+    return None
+
+
+def _find_header_end_with(img, y, w, is_m, is_y, is_c):
     def run(pred, x):
         n = 0
         while x < w and pred(*img.getpixel((x, y))[:3]):
@@ -607,17 +681,17 @@ def _find_header_end(img, y, w):
         return x, n
 
     x = 0
-    while x < w and x < 40 and not _is_magenta(*img.getpixel((x, y))[:3]):
+    while x < w and x < 40 and not is_m(*img.getpixel((x, y))[:3]):
         x += 1
     mag_start = x
-    x, nm = run(_is_magenta, x)
-    while x < w and x < 60 and not _is_yellow(*img.getpixel((x, y))[:3]):
+    x, nm = run(is_m, x)
+    while x < w and x < 60 and not is_y(*img.getpixel((x, y))[:3]):
         x += 1
-    x, ny = run(_is_yellow, x)
-    while x < w and x < 80 and not _is_cyan(*img.getpixel((x, y))[:3]):
+    x, ny = run(is_y, x)
+    while x < w and x < 80 and not is_c(*img.getpixel((x, y))[:3]):
         x += 1
     cyan_start = x
-    x, nc = run(_is_cyan, x)
+    x, nc = run(is_c, x)
     if nm < 2 or ny < 2 or nc < 2:
         return None
     band_width = (cyan_start - mag_start) / 2.0
@@ -632,7 +706,17 @@ def _find_footer_start(img, y, w):
     Data-adjacent edge is COMPUTED (see :func:`_find_header_end`): ``mag_start``
     (image right edge) and ``cyan_start`` (bounded by yellow) are data-free, so
     band_width = (mag_start-cyan_start)/2 and the footer's data-side edge is
-    cyan_start - band_width + 1 (cyan_start is the rightmost cyan pixel)."""
+    cyan_start - band_width + 1 (cyan_start is the rightmost cyan pixel).
+    Tries the strict predicates first, then the soft ordering fallback (see
+    ``_BAND_PREDICATE_PASSES``)."""
+    for is_m, is_y, is_c in _BAND_PREDICATE_PASSES:
+        r = _find_footer_start_with(img, y, w, is_m, is_y, is_c)
+        if r is not None:
+            return r
+    return None
+
+
+def _find_footer_start_with(img, y, w, is_m, is_y, is_c):
     def run(pred, x):
         n = 0
         while x >= 0 and pred(*img.getpixel((x, y))[:3]):
@@ -641,17 +725,17 @@ def _find_footer_start(img, y, w):
         return x, n
 
     x = w - 1
-    while x >= 0 and x > w - 40 and not _is_magenta(*img.getpixel((x, y))[:3]):
+    while x >= 0 and x > w - 40 and not is_m(*img.getpixel((x, y))[:3]):
         x -= 1
     mag_start = x
-    x, nm = run(_is_magenta, x)
-    while x >= 0 and x > w - 60 and not _is_yellow(*img.getpixel((x, y))[:3]):
+    x, nm = run(is_m, x)
+    while x >= 0 and x > w - 60 and not is_y(*img.getpixel((x, y))[:3]):
         x -= 1
-    x, ny = run(_is_yellow, x)
-    while x >= 0 and x > w - 80 and not _is_cyan(*img.getpixel((x, y))[:3]):
+    x, ny = run(is_y, x)
+    while x >= 0 and x > w - 80 and not is_c(*img.getpixel((x, y))[:3]):
         x -= 1
     cyan_start = x
-    x, nc = run(_is_cyan, x)
+    x, nc = run(is_c, x)
     if nm < 2 or ny < 2 or nc < 2:
         return None
     band_width = (mag_start - cyan_start) / 2.0
@@ -976,7 +1060,7 @@ def _extract_at_bottom(img):
     """Decode a bar at the bottom 2 rows of an already-resolved RGB ``img``.
 
     Tries the high-res even-fill layout first (both-ends-anchored, drift-free),
-    then falls back to the legacy scale-swept sequential layout. Both self-
+    then the small-image scale-swept sequential layout. Both self-
     validate via CRC + Reed-Solomon, so the correct one is selected by the data.
     Returns (identifier, content_hash) or None. The non-scanning core of
     :func:`extract_bar`.
@@ -1023,7 +1107,8 @@ def _extract_at_bottom(img):
         if result is not None:
             return result
 
-        # Legacy / small-image sequential layout (scale-swept).
+        # Small-image sequential layout (scale-swept) — the current writer
+        # output for every image below the even-fill crossover.
         if not scale_candidates:
             continue
         for scale in scale_candidates:

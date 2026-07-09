@@ -1,7 +1,8 @@
 """Pure Python Reed-Solomon codec over GF(2^8).
 
 Zero external dependencies. Provides forward error correction for the
-steganographic bar — corrects up to nsym//2 byte errors in the payload.
+steganographic bar — corrects up to nsym//2 byte errors anywhere in the
+codeword (payload + parity; a corrupted parity byte spends the same budget).
 
 Primitive polynomial: 0x11D (x^8 + x^4 + x^3 + x^2 + 1), same as QR codes.
 Generator root: alpha = 0x02.
