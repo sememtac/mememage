@@ -1,7 +1,8 @@
 """Mememage — a bar in an image's pixels points to a JSON record.
 
 Stamp a 2-pixel bar into an image; the bar carries an **identifier** (a key to a
-JSON record stored separately) and a **content hash** (a SHA-256 over the record).
+JSON record stored separately) and a **content hash** (a 64-bit digest — the first
+16 hex of SHA-256 — over the record).
 The core API is three functions, all pure image operations:
 
 - ``encode(image, fields)`` — write the bar, build the record from your fields.

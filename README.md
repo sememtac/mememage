@@ -9,7 +9,9 @@ Encode an identifier into an image's pixels; verify a JSON record against any co
 Mememage writes a 2-pixel-tall bar into the bottom rows of an image. The bar holds two values:
 
 - **identifier** — a short string that points to a JSON record, stored separately (a server, a CDN, IPFS, a file).
-- **content hash** — a SHA-256 over the record. `verify` recomputes it and compares against the bar.
+- **content hash** — a 64-bit digest (the first 16 hex of SHA-256) over the record. `verify` recomputes it and compares against the bar.
+
+**What's tamper-evident: the record.** Change any field and `verify` fails. Core proves the record-to-image *binding* — it does **not** police the pixels (edit the image but leave the bar, and it still verifies) and does **not** prove authorship (that's a signature's job, out of core's scope).
 
 The bar survives JPEG, resaves, screenshots, and re-uploads, so the identifier reads back from any copy. `encode` reads any image Pillow can open and writes a lossless PNG; `decode` and `verify` work on any format the bar survives. Record fields are arbitrary — captions, credits, generation parameters, links.
 
@@ -67,7 +69,7 @@ mememage.unlock(result, "hunter2")["gps"]                # '45.5,-122.6'
 
 ```bash
 mememage encode photo.png --field title="Morning fog" -o photo.json   # write the record
-mememage decode photo.jpg --record photo.json                         # VERIFIED (exit 0) / ALTERED (exit 1)
+mememage decode photo.jpg --record photo.json                         # VERIFIED (exit 0) / RECORD ALTERED (exit 1)
 mememage decode photo.jpg                                             # read the identifier only (no record)
 ```
 

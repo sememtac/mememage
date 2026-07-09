@@ -15,8 +15,8 @@ small surface a tool can ``pip install`` and use::
         ...
 
 The bar carries exactly two things: the IDENTIFIER (a key to a record stored
-separately — core does not fetch it) and the CONTENT HASH (a SHA-256 over the
-record). ``decode`` reads them back out; ``verify`` re-hashes a record and checks
+separately — core does not fetch it) and the CONTENT HASH (a 64-bit digest —
+the first 16 hex of SHA-256 — over the record). ``decode`` reads them back out; ``verify`` re-hashes a record and checks
 it against the hash in the pixels. The ``open`` hash makes every field of the
 record tamper-evident. Core stops at integrity (hash + optional field encryption);
 identity and authorship (signing) are out of scope.

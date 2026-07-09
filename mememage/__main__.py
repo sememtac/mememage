@@ -1,7 +1,7 @@
 """Mememage core CLI — `encode` / `decode` from a shell.
 
     mememage encode photo.png --field title="Morning fog" -o photo.json  # write the record
-    mememage decode photo.jpg --record photo.json                        # VERIFIED / ALTERED
+    mememage decode photo.jpg --record photo.json                        # VERIFIED / RECORD ALTERED
 
 Without -o, the record is written next to the image as <identifier>.json.
 `decode` exits 0 only on a match, so it drops straight into a CI gate.
@@ -140,7 +140,7 @@ def cmd_decode(args):
             else:
                 print("ENCRYPTED — private fields (pass --unlock / --password-env to reveal)")
     else:
-        print(f"ALTERED — {v.reason}")
+        print(f"RECORD ALTERED — {v.reason}")
     sys.exit(0 if v else 1)
 
 
