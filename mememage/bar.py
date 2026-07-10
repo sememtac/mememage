@@ -4,22 +4,30 @@ Encodes an identifier and content hash into a 2-pixel-tall bar at the
 bottom of an image. Survives JPEG recompression, social media
 re-encoding, and platform pipeline conversion (tested to q50 at typical
 sizes; small images — where bits are only 2-3px wide — have a tighter
-quality floor). Downscale + recompression has two independent limits:
+quality floor). Downscale is bounded by two mechanisms, neither of which
+gives a clean cutoff — resist the urge to state one:
 
-  * ANCHORS (hard): the 8px M/Y/C bands need >=4px post-scale, so nothing
-    decodes below 0.5x at any size. At exactly 0.5x the bands survive only
-    via the soft ordering predicates (see _BAND_PREDICATE_PASSES) — JPEG
-    chroma subsampling defeats the strict absolute cutoffs there.
-  * BIT MARGIN (soft, content-dependent): each bit needs ~3px post-scale,
-    i.e. (w - 48) * s >= 3 * n_bits — necessary but NOT sufficient. Even
-    with fat bits, saturated or high-frequency content near the bar can
-    lose the delta/2 margin under chroma subsampling and fail.
+  * ANCHORS: the 8px M/Y/C bands shrink with the image. Once they approach
+    ~4px, JPEG 4:2:0 chroma subsampling smears them past the strict colour
+    cutoffs (that's what the soft ordering predicates rescue — see
+    _BAND_PREDICATE_PASSES). On a LOSSLESS resize there is no chroma
+    subsampling, so the bands keep classifying well below that.
+  * BIT MARGIN (content-dependent): each bit needs roughly 3px after
+    scaling — necessary but NOT sufficient. Saturated or high-frequency
+    content near the bar loses the delta/2 margin under recompression and
+    fails even with fat bits.
 
-What that buys, measured on 16 real images x 3 resamplers x JPEG q70-q80:
+Because both depend on content, resampler, and whether the copy was
+recompressed, downscale survival is NOT monotone in the scale factor
+(measured: a 0.45x + JPEG copy failed where the same image at 0.4x
+decoded). Do not write "nothing decodes below Nx" — it is false; a
+lossless 0.35x copy of a 3072px render decodes.
+
+What IS measured, on 16 real images x 3 resamplers x JPEG q70-q80:
 even-fill images (>=~1000px wide) decode 60/60 at 0.9x and 59/60 at 0.8x.
-At 0.7x it's 50/60, and 0.5x is content-dependent — the soft-anchor
-fallback made it *reachable* (it was unconditionally dead before), not
-guaranteed. Do not promise 0.5x. Heavy double-reshares of a downscaled
+That is the promise. At 0.7x it's 50/60 and at 0.5x 19/60 — the
+soft-anchor fallback made half-size *reachable* (it was unconditionally
+dead before), never guaranteed. Heavy double-reshares of a downscaled
 copy are outside the envelope.
 
 Frame format (Gen I):
@@ -46,14 +54,20 @@ The decoder re-predicts the same per-column threshold from the row above. The
 8-pixel-wide M/Y/C color bands survive JPEG DCT blocks and bracket the data.
 
 Because each bit is encoded RELATIVE to the content row above the bar, the bar
-is effectively 3 rows of context, not 2: the 2 data rows PLUS that 1 reference
-row. To EXTRACT or RELOCATE a working bar you must carry all 3 rows — the 2 data
-rows on their own do not decode (their per-column reference is gone), and
-``embed_into`` rejects an image under 3px tall for the same reason. This is
-deliberate, not a quirk: a bare bar cannot be transplanted onto another image
-(it won't decode without its original reference), and a 3-row transplant onto a
-*different* image is independently caught by the EMBODIED portrait/luma-grid
-check. The bar is woven into the flesh, not stuck on as a peelable label.
+carries 3 rows of context, not 2: the 2 data rows PLUS that 1 reference row.
+``embed_into`` requires an image at least 3px tall for this reason, and the
+vertical-scan decoder crops top-down so the reference always rides along.
+
+A 2-row crop therefore usually does NOT decode — its per-column reference is
+gone. Usually, not always: the decoder falls back to Otsu and a fixed
+threshold, which recover the bits without any reference whenever the
+surrounding content is roughly uniform. Measured on the real decoder, a bare
+2-row bar fails on textured content (gradients, photos) but decodes on flat,
+dark, bright, or noisy content. So this is a property of the encoding, NOT a
+security boundary: do not describe it as "a bare bar cannot be transplanted".
+Detecting a bar moved onto a different image is the job of a portrait /
+localized-tamper check (EMBODIED in the reference application), not of the
+codec.
 
 Two width-adaptive layouts share that frame format (the choice is
 capacity-emergent — no flag, no version bump):
