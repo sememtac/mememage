@@ -6,64 +6,47 @@
 
 Encode an identifier into an image's pixels; verify a JSON record against any copy.
 
-Mememage writes a 2-pixel-tall bar into the bottom rows of an image. The bar holds two values:
+Mememage writes a 2-pixel-tall bar into the bottom of an image. It carries an **identifier** (a short pointer to a JSON record you store anywhere) and a **content hash** (first 16 hex of SHA-256 over that record). `verify` recomputes the hash and compares it to the bar. Change any field, verification fails.
 
-- **identifier** — a short string that points to a JSON record, stored separately (a server, a CDN, IPFS, a file).
-- **content hash** — a 64-bit digest (the first 16 hex of SHA-256) over the record. `verify` recomputes it and compares against the bar.
+Core proves the record-to-image *binding*, by hash alone. It does **not** police the pixels (edit the image but leave the bar and it still verifies) and does **not** prove authorship (a signature's job, out of scope). Two keys stay outside the hash by design, `signature` and `_`-prefixed keys, and `encode` refuses both as your own field names.
 
-**What's tamper-evident: the record.** Change any field and `verify` fails. Two keys sit outside the hash by design — `signature`, so a detached signature can attach later without re-hashing, and `_`-prefixed keys, reserved as unhashed scratch for decoders (`encode` refuses both as your field names). Core proves the record-to-image *binding* — it does **not** police the pixels (edit the image but leave the bar, and it still verifies) and does **not** prove authorship (that's a signature's job, out of core's scope).
-
-The bar survives JPEG, resaves, screenshots, and re-uploads, so the identifier reads back from a shared copy.
-
-**Downscaling is the limit.** A modest shrink is safe: images ≥ ~1000px wide decode after a resize to **0.8×** plus one recompression — 59 of 60 real-image round-trips, across three resamplers and JPEG q70–q80. Beyond that we make no promise. Whether a smaller copy still decodes depends on the image, the resampler, and whether it was recompressed; half-size copies of large images often decode, and aggressive downscales sometimes do too, but not dependably enough to rely on. Images already under ~1000px wide use a denser bar layout and aren't promised any downscale. `encode` reads any image Pillow can open and writes a lossless PNG; `decode` and `verify` work on any format the bar survives. Record fields are arbitrary — captions, credits, generation parameters, links — apart from a few names reserved for the format itself (`identifier`, `content_hash`, `hash_version`, `signature`, `encrypted_fields`).
+The bar survives JPEG, resaves, screenshots, and re-uploads. **Downscaling is the limit:** images ≥ ~1000px wide survive a shrink to ~0.8× plus one recompression (59/60 real-image round-trips across three resamplers and JPEG q70 to q80). Past that, no promise.
 
 ```bash
-pip install mememage                 # encode / decode / verify — Pillow included
+pip install mememage                 # encode / decode / verify (Pillow included)
 # pip install "mememage[encrypt]"    # adds AES-256 field encryption
 ```
 
 ## Quickstart
 
-Three functions, all pure image operations:
-
 ```python
 import mememage
 
-# encode — write the bar into the image, build the record from your fields
+# encode: write the bar, build a record from your fields
 result = mememage.encode("photo.png", {"title": "Morning fog", "by": "catmemes"})
-result.identifier            # 'mememage-3dc5f03a747bb38e' (derived from the fields)
-result.save("photo.json")    # the record — store or serve it separately
+result.identifier            # 'mememage-3dc5f03a747bb38e'  (derived from your fields)
+result.save("photo.json")    # a record, stored or served separately
 
-# decode — read the bar back out of the pixels (the inverse of encode)
-bar = mememage.decode("photo.jpg")      # any format the bar survived: PNG, JPEG, a screenshot
+# decode: read the bar back out of any copy (PNG, JPEG, a screenshot)
+bar = mememage.decode("photo.jpg")
 bar.identifier, bar.content_hash
 
-# verify — does a record match an image? (recomputed hash == the bar's)
-mememage.verify("photo.jpg", result.record)        # True if the record is intact
+# verify: does a record match an image?
+mememage.verify("photo.jpg", result.record)        # truthy if intact
 ```
 
-You resolve the record from its identifier — look it up wherever you keep it, then verify:
+Core does no networking. `decode` hands you an identifier; resolve the record wherever you kept it (a dict, a file, a DB, a URL), then `verify`.
 
-```python
-bar    = mememage.decode("photo.jpg")    # identifier + content hash from the pixels
-record = my_store[bar.identifier]        # your storage: a dict, a file, a DB, a URL
-mememage.verify("photo.jpg", record)     # True if the record matches the image
-```
-
-- **`encode` accepts any image** — a path, `bytes`, a file-like, a PIL `Image`, or a numpy array (HEIC needs the `[heic]` extra) — and returns the barred image as `Record.image`. Given a destination — a path (in place, or a `.png` sibling for non-PNG), `out=<path.png>`, or `out=<stream>` (e.g. `BytesIO`) — it writes the file. Output is always PNG: the bar is lossless, and a lossy re-encode would corrupt it. An in-memory input with no destination never touches disk.
-- **`decode` / `verify` accept the same in-memory forms** — a path, `bytes`, a file-like, a PIL `Image`, or a numpy array. No disk round-trip.
-- **No network I/O** — `decode` returns the identifier; you resolve the record. Core is pure pixel + hash operations.
+**Inputs / outputs.** `encode`, `decode`, and `verify` accept a path, `bytes`, a file-like, a PIL `Image`, or a numpy array (HEIC needs the `[heic]` extra). `encode` returns a barred `Record.image` and, given a destination, writes a lossless **PNG** (in place for a PNG path, a `.png` sibling otherwise, or `out=<path/stream>`); an in-memory input with no destination never touches disk. Record fields are yours (captions, credits, generation params, links) except a few reserved names: `identifier`, `content_hash`, `hash_version`, `signature`, `encrypted_fields`.
 
 ## Encrypt private fields
 
-- Mark fields `private` to encrypt them (AES-256-GCM via PBKDF2) under a password.
-- The record still **verifies without the password** — the hash covers the ciphertext.
-- `unlock` returns the decrypted fields. The password is not stored; only the ciphertext is kept in the record.
+Mark fields `private` to encrypt them (AES-256-GCM via PBKDF2) under a password. It still **verifies without the password** (the hash covers the ciphertext), and `unlock` reveals the fields. Passwords are never stored.
 
 ```python
 result = mememage.encode("photo.png", {"title": "Public", "gps": "45.5,-122.6"},
                          password="hunter2", private=["gps"])
-mememage.verify("photo.png", result.record)              # matches — no password
+mememage.verify("photo.png", result.record)              # matches, no password
 mememage.unlock(result, "hunter2")["gps"]                # '45.5,-122.6'
 ```
 
@@ -71,13 +54,11 @@ mememage.unlock(result, "hunter2")["gps"]                # '45.5,-122.6'
 
 ```bash
 mememage encode photo.png --field title="Morning fog" -o photo.json   # write the record
-mememage decode photo.jpg --record photo.json                         # VERIFIED (exit 0) / RECORD ALTERED (exit 1)
-mememage decode photo.jpg                                             # read the identifier only (no record)
+mememage decode photo.jpg --record photo.json                         # VERIFIED (0) / RECORD ALTERED (1)
+mememage decode photo.jpg                                             # read the identifier only
 ```
 
-Without `-o`, the record is written next to the image as `<identifier>.json`.
-With `--record`, `decode` exits 0 on a match and 1 on a mismatch; without it,
-exit 0 just means a bar was read.
+Without `-o`, the record lands beside the image as `<identifier>.json`. With `--record`, `decode` exits 0 on a match, 1 on a mismatch; without it, exit 0 just means a bar was read.
 
 ## License
 
