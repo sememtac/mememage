@@ -89,9 +89,17 @@ class Verification:
     re-hashed record equals the content hash baked in the pixels. ``reason``
     explains a failure (empty on success). (Core verifies integrity only;
     authorship/signatures are out of scope.) For the bar's identifier or hash,
-    call :func:`decode`."""
+    call :func:`decode`.
+
+    ``supported`` is ``False`` when the record declares a ``hash_version`` this
+    core build doesn't implement (an application-defined model). Then ``match`` is
+    ``False`` too — core can't confirm it, so it fails closed — but this is
+    **not** tamper evidence: distinguish ``not supported`` ("verify it in the app
+    that defines this version") from a genuine hash mismatch (the record changed).
+    """
     match: bool
     reason: str = ""
+    supported: bool = True
 
     def __bool__(self) -> bool:
         return self.match
@@ -344,6 +352,20 @@ def verify(image, record) -> Verification:
     bar_data = decode(image)
     if bar_data is None:
         return Verification(False, "no Mememage bar in the image")
+
+    # A record can declare a hash_version core doesn't implement (an application
+    # defines its own curated inclusion set). Don't recompute under `open` and
+    # cry mismatch — that reads as tampering when the record may be perfectly
+    # valid. Report it as unsupported and point the caller at the app's verifier.
+    if not hashing.is_supported_hash_version(rec):
+        hv = hashing.hash_version_of(rec)
+        return Verification(
+            False, supported=False,
+            reason=f"unsupported hash_version {hv!r}: this record uses a hash model "
+                   f"this core build doesn't implement (core implements "
+                   f"{hashing.OPEN_HASH_VERSION!r}). Its content hash can't be checked "
+                   f"here — verify it with the application that defines this version "
+                   f"(e.g. its web decoder). Not tamper evidence; the record may be valid.")
 
     recomputed = hashing.compute_content_hash(rec)
     if recomputed != bar_data.content_hash:

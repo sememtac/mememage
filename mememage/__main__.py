@@ -5,7 +5,9 @@
 
 Without -o, the record is written next to the image as <identifier>.json.
 With --record, `decode` exits 0 only on a match, so it drops straight into
-a CI gate; without --record, exit 0 just means a bar was read.
+a CI gate; without --record, exit 0 just means a bar was read. A record
+declaring a hash_version core doesn't implement exits 3 (UNSUPPORTED) — verify
+it with the application that defines that version, not here.
 """
 import argparse
 import sys
@@ -118,11 +120,14 @@ def cmd_decode(args):
 
     if args.json:
         print(_json.dumps({"identifier": bar.identifier, "content_hash": bar.content_hash,
-                           "match": bool(v), "reason": v.reason}))
+                           "match": bool(v), "supported": v.supported, "reason": v.reason}))
         sys.exit(0 if v else 1)
 
     print(f"Bar:  {bar.identifier}")
     print(f"Hash: {bar.content_hash}")
+    if not v.supported:
+        print(f"UNSUPPORTED — {v.reason}")
+        sys.exit(3)
     if v:
         print("VERIFIED — record matches the image")
         if record.get("encrypted_fields"):

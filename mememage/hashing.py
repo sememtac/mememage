@@ -16,6 +16,26 @@ import json
 OPEN_HASH_VERSION = "open"
 _HASH_EXCLUDED_OPEN = {"content_hash", "signature"}
 
+# The hash models this core build implements. An application can define its own
+# curated ``hash_version`` (e.g. an integer with a fixed inclusion set); core does
+# not implement those and must not pretend to — it recomputes only ``open``.
+SUPPORTED_HASH_VERSIONS = frozenset({OPEN_HASH_VERSION})
+
+
+def hash_version_of(record: dict) -> str:
+    """The record's declared hash model. Absent → the ``open`` default (core stamps
+    it on every ``encode``; a record without the field predates the field)."""
+    return record.get("hash_version", OPEN_HASH_VERSION)
+
+
+def is_supported_hash_version(record: dict) -> bool:
+    """True iff this core build implements the record's hash model.
+
+    A record carrying an application-defined ``hash_version`` (one with a curated
+    inclusion set core doesn't know) is **unsupported here**, not tampered — its
+    hash verifies in the application that defines the version, not in core."""
+    return hash_version_of(record) in SUPPORTED_HASH_VERSIONS
+
 
 def _normalize_for_hash(obj):
     """Recursively normalize values to match JS JSON.stringify behavior."""

@@ -15,6 +15,21 @@
 var OPEN_HASH_VERSION = 'open';
 var HASH_EXCLUDED_OPEN = { content_hash: 1, signature: 1 };
 
+// The hash models this core build implements. An application can define its own
+// curated hash_version core doesn't know; those verify in that application, not
+// here. Mirrors hashing.SUPPORTED_HASH_VERSIONS.
+var SUPPORTED_HASH_VERSIONS = { open: 1 };
+
+// A record's declared hash model — absent means the open default.
+function hashVersionOf(record) {
+  return (record && record.hash_version != null) ? record.hash_version : OPEN_HASH_VERSION;
+}
+
+// True iff this core build implements the record's hash model.
+function isSupportedHashVersion(record) {
+  return !!SUPPORTED_HASH_VERSIONS[hashVersionOf(record)];
+}
+
 // The fields the content hash covers under the open model: every field except
 // the structurally-circular pair (content_hash, signature) and `_`-prefixed keys
 // (reserved for decoder internals, never hashed). Mirrors hashing.open_hashable_fields.
@@ -116,13 +131,38 @@ async function computeContentHash(record) {
   catch (e) { return null; }
 }
 
-// Verify a record against the content hash read from an image's bar.
-// Returns true iff the data is intact (the re-hash matches).
-async function verify(record, barContentHash) {
+// Verify with detail: { match, supported, reason }. A record declaring a
+// hash_version core doesn't implement is `supported: false` (and match: false —
+// fail closed), NOT tampered: verify it in the app that defines the version.
+async function verifyDetailed(record, barContentHash) {
+  if (!isSupportedHashVersion(record)) {
+    var hv = hashVersionOf(record);
+    return { match: false, supported: false,
+      reason: "unsupported hash_version " + JSON.stringify(hv) + ": this record uses a "
+        + "hash model this core build doesn't implement (core implements "
+        + JSON.stringify(OPEN_HASH_VERSION) + "). Verify it with the application that "
+        + "defines this version. Not tamper evidence; the record may be valid." };
+  }
   var h = await computeContentHash(record);
-  return h !== null && h === barContentHash;
+  if (h === null) return { match: false, supported: true, reason: "could not hash record" };
+  if (h !== barContentHash) {
+    return { match: false, supported: true,
+      reason: "hash mismatch: bar says " + barContentHash + ", data recomputes to " + h };
+  }
+  return { match: true, supported: true, reason: "" };
+}
+
+// Verify a record against the content hash read from an image's bar.
+// Returns true iff the data is intact (the re-hash matches). Unsupported hash
+// versions return false (fail closed) — use verifyDetailed to tell them apart.
+async function verify(record, barContentHash) {
+  return (await verifyDetailed(record, barContentHash)).match;
 }
 
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { computeContentHash: computeContentHash, verify: verify, _hashableFields: _hashableFields };
+  module.exports = {
+    computeContentHash: computeContentHash, verify: verify, verifyDetailed: verifyDetailed,
+    isSupportedHashVersion: isSupportedHashVersion, hashVersionOf: hashVersionOf,
+    _hashableFields: _hashableFields,
+  };
 }

@@ -72,6 +72,30 @@ class TestCoreApi(unittest.TestCase):
         self.assertFalse(v)
         self.assertIn("no Mememage bar", v.reason)
 
+    def test_verify_unsupported_hash_version(self):
+        # A record declaring an app-defined hash_version core doesn't implement
+        # is UNSUPPORTED, not ALTERED — core can't judge it (fails closed), but it
+        # must not read as tampering. This is the canonical-chain V1 case.
+        img = _png()
+        rec = mememage.encode(img, {"prompt": "p"})
+        app = copy.deepcopy(rec.record)
+        app["hash_version"] = 1                 # an integer version core doesn't know
+        v = mememage.verify(img, app)
+        self.assertFalse(v)                     # fail closed — not confirmed
+        self.assertFalse(v.match)
+        self.assertFalse(v.supported)           # ...but distinctly unsupported
+        self.assertIn("unsupported hash_version", v.reason)
+        self.assertNotIn("hash mismatch", v.reason)   # never reads as tamper
+
+    def test_verify_open_records_stay_supported(self):
+        img = _png()
+        rec = mememage.encode(img, {"prompt": "p"})
+        self.assertTrue(mememage.verify(img, rec).supported)          # explicit "open"
+        # a record missing the field entirely is treated as open (back-compat)
+        no_field = copy.deepcopy(rec.record)
+        no_field.pop("hash_version")
+        self.assertTrue(mememage.verify(img, no_field).supported)
+
     def test_record_save_load_roundtrip(self):
         img = _png()
         rec = mememage.encode(img, {"prompt": "store me anywhere"})

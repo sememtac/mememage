@@ -37,6 +37,8 @@ mememage.verify("photo.jpg", result.record)        # truthy if intact
 
 Core does no networking. `decode` hands you an identifier; resolve the record wherever you kept it (a dict, a file, a DB, a URL), then `verify`.
 
+**Hash models (`hash_version`).** Core implements the **`open`** model — it hashes every field except `content_hash`/`signature`, so whatever you put in the record is tamper-evident. `encode` stamps `hash_version: "open"`. An application can define its own curated `hash_version` (a fixed inclusion set) that core doesn't implement; `verify` reports such a record as **unsupported** (`Verification.supported == False`) rather than a hash mismatch — it fails closed (`bool()` is `False`) but this is *not* tamper evidence. Verify those records with the application that defines the version (e.g. its own decoder). The CLI prints `UNSUPPORTED` and exits `3`.
+
 **Inputs / outputs.** `encode`, `decode`, and `verify` accept a path, `bytes`, a file-like, a PIL `Image`, or a numpy array (HEIC needs the `[heic]` extra). `encode` returns a barred `Record.image` and, given a destination, writes a lossless **PNG** (in place for a PNG path, a `.png` sibling otherwise, or `out=<path/stream>`); an in-memory input with no destination never touches disk. Record fields are yours (captions, credits, generation params, links) except a few reserved names: `identifier`, `content_hash`, `hash_version`, `signature`, `encrypted_fields`.
 
 ## Encrypt private fields
@@ -54,7 +56,7 @@ mememage.unlock(result, "hunter2")["gps"]                # '45.5,-122.6'
 
 ```bash
 mememage encode photo.png --field title="Morning fog" -o photo.json   # write the record
-mememage decode photo.jpg --record photo.json                         # VERIFIED (0) / RECORD ALTERED (1)
+mememage decode photo.jpg --record photo.json                         # VERIFIED (0) / RECORD ALTERED (1) / UNSUPPORTED (3)
 mememage decode photo.jpg                                             # read the identifier only
 ```
 
