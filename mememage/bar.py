@@ -265,8 +265,9 @@ def _asym_levels_columns(img, w, h):
     if y < 0:
         y = max(0, h - 1)
     rr = [0.0] * w; gg = [0.0] * w; bb = [0.0] * w
+    pix = img.load()   # one accessor, not a getpixel (with its per-call load) per column
     for x in range(w):
-        px = img.getpixel((x, y))[:3]
+        px = pix[x, y][:3]
         rr[x], gg[x], bb[x] = px[0], px[1], px[2]
     rr = _smooth1d(rr, _ASYM_BOX_RADIUS); gg = _smooth1d(gg, _ASYM_BOX_RADIUS); bb = _smooth1d(bb, _ASYM_BOX_RADIUS)
     d = _ASYM_DELTA
@@ -591,8 +592,10 @@ def _detect_bar(img, y=None):
     if y is None:
         y = h - 1
 
+    pix = img.load()   # one accessor for the whole row walk
+
     def at(x):
-        return img.getpixel((x, y))[:3]
+        return pix[x, y][:3]
 
     # Scan for magenta run from left edge
     magenta_w = 0
@@ -687,22 +690,24 @@ def _find_header_end(img, y, w):
 
 
 def _find_header_end_with(img, y, w, is_m, is_y, is_c):
+    pix = img.load()   # one accessor for the whole row walk
+
     def run(pred, x):
         n = 0
-        while x < w and pred(*img.getpixel((x, y))[:3]):
+        while x < w and pred(*pix[x, y][:3]):
             x += 1
             n += 1
         return x, n
 
     x = 0
-    while x < w and x < 40 and not is_m(*img.getpixel((x, y))[:3]):
+    while x < w and x < 40 and not is_m(*pix[x, y][:3]):
         x += 1
     mag_start = x
     x, nm = run(is_m, x)
-    while x < w and x < 60 and not is_y(*img.getpixel((x, y))[:3]):
+    while x < w and x < 60 and not is_y(*pix[x, y][:3]):
         x += 1
     x, ny = run(is_y, x)
-    while x < w and x < 80 and not is_c(*img.getpixel((x, y))[:3]):
+    while x < w and x < 80 and not is_c(*pix[x, y][:3]):
         x += 1
     cyan_start = x
     x, nc = run(is_c, x)
@@ -731,22 +736,24 @@ def _find_footer_start(img, y, w):
 
 
 def _find_footer_start_with(img, y, w, is_m, is_y, is_c):
+    pix = img.load()   # one accessor for the whole row walk
+
     def run(pred, x):
         n = 0
-        while x >= 0 and pred(*img.getpixel((x, y))[:3]):
+        while x >= 0 and pred(*pix[x, y][:3]):
             x -= 1
             n += 1
         return x, n
 
     x = w - 1
-    while x >= 0 and x > w - 40 and not is_m(*img.getpixel((x, y))[:3]):
+    while x >= 0 and x > w - 40 and not is_m(*pix[x, y][:3]):
         x -= 1
     mag_start = x
     x, nm = run(is_m, x)
-    while x >= 0 and x > w - 60 and not is_y(*img.getpixel((x, y))[:3]):
+    while x >= 0 and x > w - 60 and not is_y(*pix[x, y][:3]):
         x -= 1
     x, ny = run(is_y, x)
-    while x >= 0 and x > w - 80 and not is_c(*img.getpixel((x, y))[:3]):
+    while x >= 0 and x > w - 80 and not is_c(*pix[x, y][:3]):
         x -= 1
     cyan_start = x
     x, nc = run(is_c, x)
@@ -775,9 +782,10 @@ def _otsu_threshold(img):
             return None
         hist = [0] * 256
         total = 0
+        pix = img.load()   # one accessor, not a getpixel per histogram sample
         for y in range(max(0, h - _SIG_ROWS), h):
             for x in range(x0, x1):
-                r, g, b = img.getpixel((x, y))[:3]
+                r, g, b = pix[x, y][:3]
                 hist[int((r + g + b) / 3.0) & 255] += 1
                 total += 1
         if total == 0:
@@ -825,6 +833,20 @@ def _decode_even_fill(img, threshold=_RGB_THRESHOLD):
     if h >= 2:
         read_modes.append((h - 1,))  # bottom row only (bottom-crop survivor)
 
+    # The anchor-offset x byte-length sweep below re-samples the SAME one or two
+    # rows on every attempt — precompute each row's per-column luma once so the
+    # sweep is pure arithmetic (same values, ~1000x fewer pixel reads).
+    pix = img.load()
+    luma = {}
+    for rows in read_modes:
+        for ry in rows:
+            if ry not in luma:
+                row = [0.0] * w
+                for x in range(w):
+                    r, g, bl = pix[x, ry][:3]
+                    row[x] = (r + g + bl) / 3.0
+                luma[ry] = row
+
     # Band-edge detection lands on an integer pixel, but after a downscale the
     # true sub-pixel edge can sit a pixel or two away. That shift moves every
     # bit center the same way, flipping enough bits to exceed RS at particular
@@ -851,8 +873,7 @@ def _decode_even_fill(img, threshold=_RGB_THRESHOLD):
                             break
                         acc = 0.0
                         for ry in rows:
-                            r, g, bl = img.getpixel((px, ry))[:3]
-                            acc += (r + g + bl) / 3.0
+                            acc += luma[ry][px]
                         bits.append(1 if acc / len(rows) >= _thr(threshold, px) else 0)
                     if not ok:
                         continue
@@ -1140,6 +1161,7 @@ def _extract_at_bottom(img):
 def _decode_bits_at_scale(img, scale, ppb, threshold=_RGB_THRESHOLD):
     """Read data bits from the bar at a given scale factor and pixels-per-bit."""
     w, h = img.size
+    pix = img.load()   # one accessor, not a getpixel (with its per-call load) per sample
 
     if abs(scale - 1.0) < 0.01:
         # Exact pixel positions — no rounding drift
@@ -1159,7 +1181,7 @@ def _decode_bits_at_scale(img, scale, ppb, threshold=_RGB_THRESHOLD):
                     cx = x0 + dx
                     if cx >= data_end:
                         break
-                    r, g, b = img.getpixel((cx, y))[:3]
+                    r, g, b = pix[cx, y][:3]
                     acc += (r + g + b) / 3.0; tacc += _thr(threshold, cx); cnt += 1
                 bits.append(1 if cnt and acc / cnt >= tacc / cnt else 0)
         return bits
@@ -1180,7 +1202,7 @@ def _decode_bits_at_scale(img, scale, ppb, threshold=_RGB_THRESHOLD):
             for sx in range(sx0, max(sx0 + 1, sx1)):
                 if sx < 0 or sx >= w:
                     break
-                r, g, b = img.getpixel((sx, y))[:3]
+                r, g, b = pix[sx, y][:3]
                 acc += (r + g + b) / 3.0; tacc += _thr(threshold, sx); cnt += 1
             if cnt == 0:
                 break
