@@ -4,13 +4,13 @@
 
 # Mememage
 
-Encode an identifier into an image's pixels; verify a JSON record against any copy.
+Encode an identifier into the pixels of an image. Verify a JSON record against any copy.
 
-Mememage writes a 2-pixel-tall bar into the bottom of an image. It carries an **identifier** (a short pointer to a JSON record you store anywhere) and a **content hash** (first 16 hex of SHA-256 over that record). `verify` recomputes the hash and compares it to the bar. Change any field, verification fails.
+Mememage writes a bar into the bottom of an image. The bar is 2 pixels tall. It holds an **identifier** and a **content hash**. The identifier is a short pointer to a JSON record that you store anywhere. The content hash is the first 16 hex characters of the SHA-256 of that record. `verify` recomputes the hash and compares it to the bar. If you change any field, verification fails.
 
-Core proves the record-to-image *binding*, by hash alone. It does **not** police the pixels (edit the image but leave the bar and it still verifies) and does **not** prove authorship (a signature's job, out of scope). Two keys stay outside the hash by design, `signature` and `_`-prefixed keys, and `encode` refuses both as your own field names.
+Core proves the link between a record and an image, by hash alone. It does **not** check the pixels. You can edit the image, and if the bar stays, the image still verifies. Core does **not** prove authorship. That is the job of a signature, which is out of scope. Two keys stay outside the hash by design: `signature` and `_`-prefixed keys. `encode` does not let you use either name for your own field.
 
-The bar survives JPEG, resaves, screenshots, and re-uploads. **Downscaling is the limit:** images ≥ ~1000px wide survive a shrink to ~0.8× plus one recompression (59/60 real-image round-trips across three resamplers and JPEG q70 to q80). Past that, no promise.
+The bar survives JPEG, resaves, screenshots, and re-uploads. **Downscaling is the limit.** An image that is about 1000 px wide or more survives a shrink to about 0.8x and one re-compression (59 of 60 real-image round-trips, across three resamplers and JPEG q70 to q80). Past that limit, Mememage makes no promise.
 
 ```bash
 pip install mememage                 # encode / decode / verify (Pillow included)
@@ -22,28 +22,28 @@ pip install mememage                 # encode / decode / verify (Pillow included
 ```python
 import mememage
 
-# encode: write the bar, build a record from your fields
+# encode: write the bar and build a record from your fields
 result = mememage.encode("photo.png", {"title": "Morning fog", "by": "catmemes"})
-result.identifier            # 'mememage-3dc5f03a747bb38e'  (derived from your fields)
-result.save("photo.json")    # a record, stored or served separately
+result.identifier            # 'mememage-3dc5f03a747bb38e'  (from your fields)
+result.save("photo.json")    # store or serve the record separately
 
-# decode: read the bar back out of any copy (PNG, JPEG, a screenshot)
+# decode: read the bar from any copy (PNG, JPEG, a screenshot)
 bar = mememage.decode("photo.jpg")
 bar.identifier, bar.content_hash
 
 # verify: does a record match an image?
-mememage.verify("photo.jpg", result.record)        # truthy if intact
+mememage.verify("photo.jpg", result.record)        # truthy if the record is intact
 ```
 
-Core does no networking. `decode` hands you an identifier; resolve the record wherever you kept it (a dict, a file, a DB, a URL), then `verify`.
+Core does no networking. `decode` gives you an identifier. Resolve the record where you kept it (a dict, a file, a database, a URL). Then call `verify`.
 
-**Hash models (`hash_version`).** Core implements the **`open`** model — it hashes every field except `content_hash`/`signature`, so whatever you put in the record is tamper-evident. `encode` stamps `hash_version: "open"`. An application can define its own curated `hash_version` (a fixed inclusion set) that core doesn't implement; `verify` reports such a record as **unsupported** (`Verification.supported == False`) rather than a hash mismatch — it fails closed (`bool()` is `False`) but this is *not* tamper evidence. Verify those records with the application that defines the version (e.g. its own decoder). The CLI prints `UNSUPPORTED` and exits `3`.
+**Hash models (`hash_version`).** Core implements the **`open`** model. It hashes every field except `content_hash` and `signature`. So the record is tamper-evident, whatever you put in it. `encode` stamps `hash_version: "open"`. An application can define its own `hash_version` with a fixed set of fields. Core does not implement those models. For such a record, `verify` reports **unsupported** (`Verification.supported == False`), not a hash mismatch. It fails closed (`bool()` is `False`), but this is *not* evidence of tampering. Verify those records with the application that defines the version, for example its own decoder. The CLI prints `UNSUPPORTED` and exits `3`.
 
-**Inputs / outputs.** `encode`, `decode`, and `verify` accept a path, `bytes`, a file-like, a PIL `Image`, or a numpy array (HEIC needs the `[heic]` extra). `encode` returns a barred `Record.image` and, given a destination, writes a lossless **PNG** (in place for a PNG path, a `.png` sibling otherwise, or `out=<path/stream>`); an in-memory input with no destination never touches disk. Record fields are yours (captions, credits, generation params, links) except a few reserved names: `identifier`, `content_hash`, `hash_version`, `signature`, `encrypted_fields`.
+**Inputs and outputs.** `encode`, `decode`, and `verify` accept a path, `bytes`, a file-like object, a PIL `Image`, or a numpy array. (HEIC needs the `[heic]` extra.) `encode` returns a barred `Record.image`. Given a destination, it writes a lossless **PNG**: in place for a PNG path, a `.png` sibling for any other path, or to `out=<path or stream>`. An in-memory input with no destination never touches the disk. The record fields are yours (captions, credits, generation parameters, links). A few names are reserved: `identifier`, `content_hash`, `hash_version`, `signature`, and `encrypted_fields`.
 
 ## Encrypt private fields
 
-Mark fields `private` to encrypt them (AES-256-GCM via PBKDF2) under a password. It still **verifies without the password** (the hash covers the ciphertext), and `unlock` reveals the fields. Passwords are never stored.
+Mark fields as `private` to encrypt them under a password (AES-256-GCM via PBKDF2). The record still **verifies without the password**, because the hash covers the ciphertext. `unlock` reveals the fields. Mememage never stores the password.
 
 ```python
 result = mememage.encode("photo.png", {"title": "Public", "gps": "45.5,-122.6"},
@@ -60,7 +60,7 @@ mememage decode photo.jpg --record photo.json                         # VERIFIED
 mememage decode photo.jpg                                             # read the identifier only
 ```
 
-Without `-o`, the record lands beside the image as `<identifier>.json`. With `--record`, `decode` exits 0 on a match, 1 on a mismatch; without it, exit 0 just means a bar was read.
+Without `-o`, the record lands beside the image as `<identifier>.json`. With `--record`, `decode` exits 0 on a match and 1 on a mismatch. Without `--record`, exit 0 means only that a bar was read.
 
 ## License
 

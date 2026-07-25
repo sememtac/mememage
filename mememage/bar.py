@@ -420,6 +420,77 @@ def _write_sequential(img, w, h, data_width, bits, bit_rgb, payload):
 
 _HEXSET = frozenset('0123456789abcdef')
 
+# Source modes that carry an alpha channel. A source in one of these keeps its
+# alpha through the embed (see embed_into); every other mode normalizes to RGB.
+# ('P' is alpha-carrying only when it holds a `transparency` entry, so it is
+# tested separately.)
+_ALPHA_MODES = frozenset({'RGBA', 'LA', 'La', 'PA', 'RGBa'})
+
+# Modes that hold more than 8 bits per channel. The bar is 8-bit colour, so
+# stamping one of these means converting it — and Pillow's conversion CLIPS at
+# 255 instead of scaling, which turns a 16-bit scan, depth map, or heightmap into
+# a near-white image. Refuse instead: a provenance tool must never hand back an
+# image that differs from the one it was given.
+_HIGH_DEPTH_MODES = frozenset({'I', 'I;16', 'I;16B', 'I;16L', 'I;16N', 'F'})
+
+
+def _reject_lossy_sources(src):
+    """Refuse a source the bar cannot be stamped into without changing it.
+
+    The contract: an encode is lossless everywhere except the 2 bar rows. These
+    two cases cannot meet it, so they raise instead of silently returning a
+    different image.
+    """
+    if src.mode in _HIGH_DEPTH_MODES:
+        raise ValueError(
+            f"cannot stamp a {src.mode} image: the bar is 8-bit colour, and the "
+            f"conversion clips high values to white instead of scaling them, which "
+            f"would change every pixel. Convert the image to 8-bit RGB first."
+        )
+    if getattr(src, "n_frames", 1) > 1:
+        raise ValueError(
+            f"cannot stamp an animated image ({src.n_frames} frames): only the first "
+            f"frame would survive. Extract the frame you want to stamp first."
+        )
+
+
+def png_save_kwargs(image):
+    """PNG ``save()`` keywords that carry an image's metadata onto a barred copy.
+
+    The bar changes 2 rows of pixels. Everything else about the image — its text
+    chunks, EXIF (camera, date, orientation), physical size, and colour profile —
+    is the caller's data, so both write paths carry it across. Returns a dict to
+    splat into ``Image.save``.
+    """
+    kwargs = {}
+    info = getattr(image, "info", {}) or {}
+
+    text = getattr(image, "text", None) or {}
+    if text:
+        from PIL.PngImagePlugin import PngInfo
+        pnginfo = PngInfo()
+        for key, value in text.items():
+            if key.startswith('XML:'):
+                pnginfo.add_itxt(key, value)
+            else:
+                pnginfo.add_text(key, value)
+        kwargs['pnginfo'] = pnginfo
+
+    exif = info.get('exif')
+    if not exif:
+        try:
+            raw = image.getexif()
+            exif = raw.tobytes() if raw else None
+        except Exception:
+            exif = None
+    if exif:
+        kwargs['exif'] = exif
+
+    for key in ('dpi', 'icc_profile'):
+        if info.get(key):
+            kwargs[key] = info[key]
+    return kwargs
+
 
 def _pack_payload(identifier, content_hash):
     """Pack the bar payload to BINARY: ``[prefix_len][prefix][8 id-bytes][8 hash-bytes]``.
@@ -453,9 +524,14 @@ def embed_into(image, identifier, content_hash):
     """Write a Mememage bar into the bottom 2 rows of an image, IN MEMORY.
 
     Reads any image :func:`_resolve_image` accepts (path, bytes, file-like, PIL
-    Image, numpy array) and returns a NEW barred RGB ``PIL.Image`` — no disk, and
-    the caller's image is never mutated. The disk wrapper :func:`embed_bar` and
-    the core ``encode`` both build on this.
+    Image, numpy array) and returns a NEW barred ``PIL.Image`` — no disk, and the
+    caller's image is never mutated. The disk wrapper :func:`embed_bar` and the
+    core ``encode`` both build on this.
+
+    The result is **RGB**, or **RGBA when the source carries alpha**. An alpha
+    channel is the caller's data, so the embed keeps it: only the 2 bar rows go
+    opaque (alpha 255). A greyscale, palette, or CMYK source becomes RGB, because
+    the bar's bands are coloured.
 
     Args:
         image: the source image (any in-memory or on-disk form).
@@ -469,9 +545,44 @@ def embed_into(image, identifier, content_hash):
     """
     payload = _pack_payload(identifier, content_hash)
 
-    # Fresh RGB copy — convert() always returns a new image, so the caller's
-    # image is left untouched even when it's already RGB.
-    img = _resolve_image(image).convert('RGB')
+    # Fresh copy in a mode the bar can be written into. Both convert() and copy()
+    # return a NEW image, so the caller's image is left untouched either way.
+    #
+    # The bands are coloured, so a greyscale, palette, or CMYK source must become
+    # a colour image. An ALPHA channel is different: it is the caller's data (a
+    # texture's mask, a cut-out's transparency), so keep it. The writers paint RGB
+    # triples and PIL fills alpha to 255 on each written pixel, so the 2 bar rows
+    # go opaque and every other pixel keeps the alpha it arrived with. This is
+    # what the JS SDK already does, so the two languages now agree.
+    src = _resolve_image(image)
+    _reject_lossy_sources(src)
+    if src.mode == 'RGBA':
+        img = src.copy()
+    elif src.mode in _ALPHA_MODES or (src.mode == 'P' and 'transparency' in src.info):
+        # PIL cannot convert the premultiplied 'La' mode straight to RGBA (it
+        # routes through 'L' and raises), so step through 'LA'. Before this, an
+        # 'La' source raised the same error in the RGB branch.
+        img = (src.convert('LA') if src.mode == 'La' else src).convert('RGBA')
+    else:
+        img = src.convert('RGB')
+
+    # Carry the source's metadata onto the copy, so whichever path saves it can
+    # write the metadata back out (see png_save_kwargs). convert()/copy() do not
+    # bring the PNG text chunks along, and a JPEG source keeps its EXIF in info.
+    for key in ('exif', 'dpi', 'icc_profile'):
+        if src.info.get(key):
+            img.info[key] = src.info[key]
+    if 'exif' not in img.info:
+        try:
+            raw = src.getexif()
+            if raw:
+                img.info['exif'] = raw.tobytes()
+        except Exception:
+            pass
+    src_text = getattr(src, 'text', None)
+    if src_text:
+        img.text = dict(src_text)
+
     w, h = img.size
 
     # The asym camo reads a reference row immediately above the 2 bar rows
@@ -554,21 +665,13 @@ def embed_bar(image_path, identifier, content_hash):
     """
     img = embed_into(image_path, identifier, content_hash)
 
-    # Preserve PNG metadata from the original on disk.
-    from PIL.PngImagePlugin import PngInfo
-    original = _get_Image().open(image_path)
-    pnginfo = PngInfo()
-    if hasattr(original, 'text'):
-        for key, value in original.text.items():
-            if key.startswith('XML:'):
-                pnginfo.add_itxt(key, value)
-            else:
-                pnginfo.add_text(key, value)
-    original.close()
-
     if not str(image_path).lower().endswith('.png'):
         raise ValueError(f"Bar encoding requires PNG format, got: {image_path}")
-    img.save(image_path, pnginfo=pnginfo)
+    # embed_into carried the source's metadata onto the copy; png_save_kwargs
+    # turns it back into save keywords. Both write paths share this one helper,
+    # so they cannot drift (they used to: this path kept the PNG text chunks and
+    # api.encode dropped them).
+    img.save(image_path, **png_save_kwargs(img))
 
 
 # ---------------------------------------------------------------------------

@@ -34,12 +34,30 @@ def is_supported_hash_version(record: dict) -> bool:
     A record carrying an application-defined ``hash_version`` (one with a curated
     inclusion set core doesn't know) is **unsupported here**, not tampered — its
     hash verifies in the application that defines the version, not in core."""
-    return hash_version_of(record) in SUPPORTED_HASH_VERSIONS
+    hv = hash_version_of(record)
+    # A malformed record can carry an unhashable value here (a list, a dict). It
+    # is unsupported, not a crash — `in` on a set would raise TypeError.
+    if not isinstance(hv, str):
+        return False
+    return hv in SUPPORTED_HASH_VERSIONS
 
 
 def _normalize_for_hash(obj):
     """Recursively normalize values to match JS JSON.stringify behavior."""
     if isinstance(obj, dict):
+        for k in obj:
+            # JSON keys are strings. Python lets a dict key be an int, and
+            # json.dumps then coerces it — but it SORTS the original int (2, 10)
+            # and writes the coerced string, so the record hashes in one order and
+            # re-hashes in another ("10" < "2") the moment it is stored as JSON and
+            # read back. The record would stop verifying against its own image.
+            # Refuse instead of baking a record that cannot survive a round-trip.
+            if not isinstance(k, str):
+                raise ValueError(
+                    f"record keys must be strings; got {type(k).__name__} {k!r}. "
+                    f"JSON has no non-string keys, so such a record stops verifying "
+                    f"after it is saved and read back. Convert the key to a string."
+                )
         return {k: _normalize_for_hash(v) for k, v in obj.items()}
     if isinstance(obj, list):
         return [_normalize_for_hash(v) for v in obj]

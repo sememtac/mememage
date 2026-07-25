@@ -258,20 +258,24 @@ def encode(image, fields=None, *, prefix="mememage", identifier=None,
     # any written file must be PNG (a lossy save would scramble it).
     import os
     written = None
+    # The bar changes 2 rows of pixels; everything else about the source image is
+    # the caller's data. These keywords carry its text chunks, EXIF (camera, date,
+    # orientation), physical size, and colour profile onto the barred PNG.
+    keep = bar.png_save_kwargs(barred)
     if out is not None:
         if isinstance(out, (str, os.PathLike)):
             if not str(out).lower().endswith(".png"):
                 raise ValueError("encode writes a lossless PNG (the bar can't survive "
                                  f"lossy formats); out must end in .png, got {out}")
-            barred.save(out, "PNG")
+            barred.save(out, "PNG", **keep)
             written = str(out)
         else:                                   # file-like (e.g. BytesIO)
-            barred.save(out, "PNG")
+            barred.save(out, "PNG", **keep)
     elif isinstance(image, (str, os.PathLike)):
         # Path input, no out: write in place (PNG) or to a `.png` sibling.
         src = str(image)
         written = src if src.lower().endswith(".png") else _swap_to_png(src)
-        barred.save(written, "PNG")
+        barred.save(written, "PNG", **keep)
     # else: in-memory input, no out -> Record.image only (no disk).
 
     return Record(record=record, image_path=written, image=barred)
@@ -323,10 +327,22 @@ def unlock(record, password) -> dict:
     record with no ``encrypted_fields`` is returned unchanged. Raises ``ValueError``
     on the wrong password.
     """
-    rec = record.record if isinstance(record, Record) else dict(record)
+    # unlock must never hand back a plausible-looking view of a record it did not
+    # actually open. A non-dict record used to slip through `dict(record)`:
+    # unlock([]) returned {}, and a garbage envelope returned the record
+    # unchanged — a caller asking for the readable view could not tell the
+    # difference. Say what went wrong instead.
+    rec = record.record if isinstance(record, Record) else record
+    if not isinstance(rec, dict):
+        raise ValueError(f"record must be a JSON object (a dict); got {type(rec).__name__}")
+    rec = dict(rec)
     env = rec.get("encrypted_fields")
-    if not env:
-        return dict(rec)
+    if env is None:
+        return dict(rec)                     # nothing sealed — the plain record
+    if not isinstance(env, dict) or not env:
+        raise ValueError(
+            f"encrypted_fields is malformed: expected a dict of hex strings "
+            f"{{salt, iv, ct, tag}}, got {type(env).__name__}. The record cannot be unlocked.")
     from mememage import crypto
     private = json.loads(crypto.decrypt_field(env, password))
     view = {k: v for k, v in rec.items() if k != "encrypted_fields"}
@@ -353,6 +369,16 @@ def verify(image, record) -> Verification:
     if bar_data is None:
         return Verification(False, "no Mememage bar in the image")
 
+    # A record is a JSON object. Anything else (None from a failed fetch, a list
+    # from a JSON array, a raw string) is a caller mistake, not tamper evidence —
+    # report it, never raise. The JS SDK already answered these with a verdict;
+    # this side used to crash with an AttributeError.
+    if not isinstance(rec, dict):
+        return Verification(
+            False, supported=False,
+            reason=f"record must be a JSON object (a dict); got {type(rec).__name__}. "
+                   f"Nothing was checked, so this is not tamper evidence.")
+
     # A record can declare a hash_version core doesn't implement (an application
     # defines its own curated inclusion set). Don't recompute under `open` and
     # cry mismatch — that reads as tampering when the record may be perfectly
@@ -367,7 +393,15 @@ def verify(image, record) -> Verification:
                    f"here — verify it with the application that defines this version "
                    f"(e.g. its web decoder). Not tamper evidence; the record may be valid.")
 
-    recomputed = hashing.compute_content_hash(rec)
+    # A record the hash kernel refuses (a non-string key, NaN) cannot be checked.
+    # Say so; do not raise out of a verification call.
+    try:
+        recomputed = hashing.compute_content_hash(rec)
+    except ValueError as exc:
+        return Verification(
+            False, supported=False,
+            reason=f"record can't be hashed: {exc} Nothing was checked, so this is "
+                   f"not tamper evidence.")
     if recomputed != bar_data.content_hash:
         return Verification(False, f"hash mismatch: image bar says {bar_data.content_hash}, "
                               f"data recomputes to {recomputed}")

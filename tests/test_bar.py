@@ -125,7 +125,7 @@ class TestBarRoundTrip(unittest.TestCase):
         self.assertIsNone(_try_decode_frame(bits))
 
     def test_rgba_image(self):
-        """Bar should handle RGBA images (converted to RGB)."""
+        """Bar should handle RGBA images (alpha kept — see test_bar_alpha.py)."""
         img = Image.new('RGBA', (1024, 768), (100, 150, 200, 255))
         f = tempfile.NamedTemporaryFile(suffix='.png', delete=False)
         img.save(f.name)
