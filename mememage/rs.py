@@ -89,8 +89,12 @@ def _generator_poly(nsym):
 
 def rs_encode(data: bytes, nsym: int) -> bytes:
     """Append nsym parity bytes to data. Returns data + parity."""
+    # nsym <= 0 used to return the data with NO parity, so a caller who passed a
+    # bad count got zero error correction and no hint that anything was wrong.
+    # A codec that believes it is protected but is not is worse than one that
+    # stops.
     if nsym <= 0:
-        return data
+        raise ValueError(f"nsym must be at least 1 parity byte; got {nsym}")
     if len(data) + nsym > 255:
         raise ValueError(
             f"RS codeword too large: {len(data)} + {nsym} = {len(data) + nsym} > 255 (GF(256) limit)"
@@ -247,10 +251,19 @@ def _solve_error_values(synd, positions):
 def rs_decode(data: bytes, nsym: int) -> bytes:
     """Decode an RS codeword. Returns corrected data (parity stripped).
 
-    Raises ValueError if errors are uncorrectable.
+    Raises ValueError if errors are uncorrectable, if nsym is not a positive
+    parity count, or if the codeword is too short to hold one.
     """
     if nsym <= 0:
-        return data
+        raise ValueError(f"nsym must be at least 1 parity byte; got {nsym}")
+    # A codeword cannot be shorter than its own parity: that payload length is
+    # negative. An empty codeword raised IndexError out of the syndrome loop, and
+    # a 2-byte codeword with nsym=6 silently returned b"". Note the boundary is
+    # STRICTLY less than: len == nsym is the valid encoding of an EMPTY payload,
+    # which rs_encode(b"", nsym) produces and tests/test_rs.py round-trips.
+    if len(data) < nsym:
+        raise ValueError(
+            f"codeword too short: {len(data)} bytes cannot hold {nsym} parity bytes")
     msg = list(data)
     synd = _syndromes(msg, nsym)
 

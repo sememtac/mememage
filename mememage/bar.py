@@ -275,9 +275,22 @@ def _asym_levels_columns(img, w, h):
     for x in range(w):
         r, g, b = rr[x], gg[x], bb[x]
         cr, cg, cb = _hue_floor(r, g, b, _ASYM_FLOOR)
-        one_rgb.append((cr, cg, cb))
-        zero_rgb.append((cr - d, cg - d, cb - d))
-        thr.append((cr + cg + cb) / 3.0 - d / 2.0)
+        # Clamp to the channel range HERE, the same way _bit_rgb does when it
+        # paints. On dark content "content - delta" goes negative, and the writer
+        # clamps it to 0 — so the painted "0" sits HIGHER than `cr - d` implies.
+        # The threshold used to assume the full delta anyway, which put it below
+        # the mark actually on the page: a "0" then read back as a "1". Measured
+        # on a real 768x1344 mint, 528 of 720 columns had their gap shrunk, the
+        # worst by 22.7 of the 40, and 17 bits flipped — far past what
+        # Reed-Solomon can repair, so a correctly written bar read as unreadable.
+        # Taking the midpoint of what is REALLY painted fixes it in both
+        # directions (a bright image can clamp the "1" at 255 the same way).
+        one = (min(255.0, max(0.0, cr)), min(255.0, max(0.0, cg)), min(255.0, max(0.0, cb)))
+        zero = (min(255.0, max(0.0, cr - d)), min(255.0, max(0.0, cg - d)),
+                min(255.0, max(0.0, cb - d)))
+        one_rgb.append(one)
+        zero_rgb.append(zero)
+        thr.append(((one[0] + one[1] + one[2]) / 3.0 + (zero[0] + zero[1] + zero[2]) / 3.0) / 2.0)
     return one_rgb, zero_rgb, thr
 
 
